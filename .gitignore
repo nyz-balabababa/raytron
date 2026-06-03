@@ -1,0 +1,54 @@
+# ── 模型权重（太大，不进 git）──
+model/
+sam3/
+assets/
+
+# ── 训练数据（5万+图片，太大）──
+test/data1/
+test/data3/
+test/data4/
+test/data5/
+test/data6/
+test/data7/
+
+# ── 生成的伪标签 & 训练输出（体积大，可重新生成）──
+test/prompt_test_output/
+test/train_output/
+test/yolo_world_dataset/
+test/yolo_world_dataset_v2/
+test/yolo_world_dataset_v3/
+test/yolo_dataset/
+test/preprocessed/
+
+# ── test 下其他生成文件 ──
+test/txt/
+test/*.csv
+test/*.log
+test/clean_outliers_list.txt
+test/*.xml
+
+# ── 分析中间产物 ──
+csv/
+noisy_data/
+*.zip
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ── Claude ──
+.claude/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db

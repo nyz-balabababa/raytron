@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+.git
+.vscode
+test/preprocessed
+test/preprocessed_inference
+test/prompt_test_output
+docs
+data
+*.csv
+*.md
