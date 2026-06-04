@@ -4,15 +4,10 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-VAL_LIST = ROOT / "test" / "train_list_d5&7.txt"
-OUTPUT = ROOT / "test" / "json" / "train_d5&7_tasks.json"
+VAL_LIST = ROOT / "test" / "train_list_d1.txt"
+OUTPUT = ROOT / "test" / "json" / "train(person).json"
 
-PROMPTS = ["fire hydrant",   # 消火栓箱 / 消防设备
-            "circuit board",          # 电路板 / PCB
-            "cable connector",        # 电缆接头 / 接线盒
-            "trash can" ,           # 垃圾桶 / 垃圾箱
-            "computer"               
-            ]  
+PROMPTS = [ "person" ]
 
 
 def main():

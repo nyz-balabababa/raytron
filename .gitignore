@@ -26,6 +26,10 @@ test/*.csv
 test/*.log
 test/clean_outliers_list.txt
 test/*.xml
+test/_tmp_pycache/
+test/copy_paste_tail/
+test/crop_tail/
+test/crop_person_data1/
 
 # ── 分析中间产物 ──
 csv/

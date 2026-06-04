@@ -2,10 +2,11 @@
 """
 Prompt 测试与评估脚本（含自适应预处理）
 - 自动发现 test/ 下所有任务 JSON，逐个推理
-- 推理前先对图片执行自适应预处理（尺寸统一/反色/CLAHE/降噪/锐化）
+- 推理前先对图片执行自适应预处理（不做 resize，仅做反色/CLAHE/降噪/锐化）
 - 输出：pred JSON + 统计 CSV + 可视化 + 预处理日志
 """
 import csv
+import inspect
 import json
 import os
 import sys
@@ -24,19 +25,40 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))  # 让 src/ 下的脚本能 import 项目根目录的 inference
 
-from inference import (
-    load_model,
-    do_inference,
-    DEVICE,
-)
+import inference as inference_module
+
+inference_module.cv2 = cv2
+load_model = inference_module.load_model
+do_inference = inference_module.do_inference
+DEVICE = inference_module.DEVICE
 
 # ── 配置（按需修改） ─────────────────────────────────────────────────
 
 IMAGE_ROOT = ROOT                 # 图片根目录，与 JSON 中 image_path 拼接
 CHECKPOINT = ROOT / "model" / "sam3.pt"
+MODEL_DIR = ROOT / "model" / "clipseg-rd64-refined"
 OUTPUT_ROOT = ROOT / "test" / "prompt_test_output"
-CONF_THRESHOLD = 0.01
+RAW_STATS_CONF_THRESHOLD = 0.01   # 过滤前统计用，尽量保留 teacher 原始响应
+DEFAULT_OUTPUT_CONF_THRESHOLD = 0.60  # 未单独配置的 prompt 默认输出阈值
+OUTPUT_CONF_THRESHOLDS = {
+    "person": 0.70,
+    "computer": 0.60,
+    "trash can": 0.65,
+    "cable connector": 0.60,
+    "fire hydrant": 0.70,
+    "electrical panel": 0.65,
+    "chair": 0.65,
+    "cable": 0.70,
+    "pipe": 0.75,
+    "sensor": 0.75,
+}
 MAX_VIS_IMAGES = 30  # 每个JSON最多可视化多少张图（按命中 prompt 数量排序）
+REQUIRE_CUDA = True             # True=检测不到 CUDA 直接退出，避免误用 CPU 跑几十小时
+TASK_JSON_WHITELIST = [
+    "train(person).json",
+    "val(person).json",
+]  # 只跑当前 data1/person 伪标签任务
+AUTO_SELECT_WHITELIST = True    # True=命中过滤名单后直接运行，不再交互选择
 
 # 预处理开关
 ENABLE_PREPROCESS = True          # True=推理前先自适应预处理
@@ -44,13 +66,72 @@ KEEP_PREPROCESSED = False         # True=保留预处理图片到 PREPROCESS_DIR
 PREPROCESS_DIR = ROOT / "test" / "preprocessed_inference"
 
 # 预处理参数
-TARGET_W, TARGET_H = 640, 512  # 已移除 resize，保留参数仅供后续可能恢复
+# 当前版本不做尺寸归一化，保留原始分辨率送入 SAM3 以保护小目标。
 STD_LOW, STD_MID = 35, 50
 NOISE_HIGH, NOISE_MED = 12, 8
 BLUR_LOW, BLUR_MID = 150, 300
 INVERT_KEYWORDS = ["blackHot"]  # 文件名辅助检测（优先级低于内容检测）
 PSEUDO_COLOR_SAT_THRESH = 60  # HSV 饱和度均值 > 此值视为伪彩色图，转为灰度
 BLACKHOT_SKEW_THRESH = -0.3   # 直方图偏度 < 此值判定为黑热（左偏 → 需要反色）
+
+
+# ── inference.py 接口适配 ───────────────────────────────────────────
+
+def load_prompt_model():
+    """兼容官方 SAM3 与本地 CLIPSeg 两种 inference.py 接口。"""
+    sig = inspect.signature(load_model)
+    params = list(sig.parameters.keys())
+    if params == ["checkpoint_path"]:
+        return load_model(str(CHECKPOINT))
+    if "checkpoint_path" in sig.parameters:
+        return load_model(str(MODEL_DIR), checkpoint_path=str(CHECKPOINT))
+    return load_model(str(CHECKPOINT))
+
+
+def run_prompt_inference(infer_path: str, prompts: list, model, processor, conf_threshold: float):
+    """兼容 do_inference 是否需要 model 参数的两种签名。"""
+    sig = inspect.signature(do_inference)
+    kwargs = {
+        "image_path": infer_path,
+        "text_prompts": prompts,
+        "processor": processor,
+        "conf_threshold": conf_threshold,
+    }
+    if "model" in sig.parameters:
+        kwargs["model"] = model
+    return do_inference(**kwargs)
+
+
+def get_output_threshold(prompt: str) -> float:
+    return OUTPUT_CONF_THRESHOLDS.get(prompt, DEFAULT_OUTPUT_CONF_THRESHOLD)
+
+
+def group_prompts_by_threshold(prompts: list[str]) -> dict[float, list[str]]:
+    grouped = defaultdict(list)
+    for prompt in prompts:
+        grouped[get_output_threshold(prompt)].append(prompt)
+    return dict(sorted(grouped.items(), key=lambda x: x[0]))
+
+
+def log_runtime_device():
+    """打印并校验实际运行时设备，防止导入错环境或 CPU 误跑。"""
+    cuda_available = torch.cuda.is_available()
+    print("  运行时检查:")
+    print(f"    inference.py: {Path(inference_module.__file__).resolve()}")
+    print(f"    torch:        {torch.__version__}")
+    print(f"    torch cuda:   {cuda_available}")
+    if cuda_available:
+        print(f"    GPU:          {torch.cuda.get_device_name(0)}")
+        print(f"    CUDA runtime: {torch.version.cuda}")
+    print(f"    inference.DEVICE: {getattr(inference_module, 'DEVICE', 'N/A')}")
+
+    if REQUIRE_CUDA and (not cuda_available or getattr(inference_module, "DEVICE", "cpu") != "cuda"):
+        print()
+        print("错误: 当前没有使用 CUDA。已停止，避免在 CPU 上长时间误跑。")
+        print("请在 4090 机器上检查:")
+        print('  python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \'CPU\')"')
+        print('  python -c "import inference; print(inference.__file__); print(inference.DEVICE)"')
+        sys.exit(1)
 
 
 # ── 预处理函数 ──────────────────────────────────────────────────────
@@ -266,13 +347,24 @@ def run_json(json_path: Path, image_root: Path):
     print(f"  图片数:      {len(image_paths)}")
     print(f"  Prompt 数:   {len(prompts)}")
     print(f"  Prompts:     {prompts}")
+    print(f"  原始统计阈值: {RAW_STATS_CONF_THRESHOLD:.2f}")
+    print("  输出过滤阈值:")
+    for prompt in prompts:
+        print(f"    - {prompt}: {get_output_threshold(prompt):.2f}")
+    if ENABLE_PREPROCESS:
+        print("  预处理策略:  原始分辨率直推 SAM3（不做 resize）+ 反色/CLAHE/降噪/锐化")
+    else:
+        print("  预处理策略:  关闭，原图直接推理")
     print()
 
-    model, processor = load_model(str(CHECKPOINT))
+    model, processor = load_prompt_model()
+    output_threshold_groups = group_prompts_by_threshold(prompts)
 
     all_results = []
-    per_prompt_hits = defaultdict(list)
-    per_prompt_misses = defaultdict(int)
+    raw_prompt_hits = defaultdict(list)
+    raw_prompt_misses = defaultdict(int)
+    filtered_prompt_hits = defaultdict(list)
+    filtered_prompt_misses = defaultdict(int)
     prompt_seen = defaultdict(int)
 
     t0 = time.time()
@@ -295,12 +387,15 @@ def run_json(json_path: Path, image_root: Path):
             infer_path = preprocess_image(abs_path, pp_dir)
 
         try:
-            results_by_prompt, w, h = do_inference(
-                image_path=infer_path,
-                text_prompts=prompts,
-                processor=processor,
-                conf_threshold=CONF_THRESHOLD,
+            raw_results_by_prompt, w, h = run_prompt_inference(
+                infer_path, prompts, model, processor, RAW_STATS_CONF_THRESHOLD
             )
+            filtered_results_by_prompt = {}
+            for conf_threshold, prompt_group in output_threshold_groups.items():
+                group_results, _, _ = run_prompt_inference(
+                    infer_path, prompt_group, model, processor, conf_threshold
+                )
+                filtered_results_by_prompt.update(group_results)
         except Exception as e:
             tqdm.write(f"  [!] {rel_path}: {e}")
             if ENABLE_PREPROCESS and not KEEP_PREPROCESSED and infer_path != abs_path:
@@ -315,17 +410,27 @@ def run_json(json_path: Path, image_root: Path):
 
         for prompt in prompts:
             prompt_seen[prompt] += 1
-            pred = results_by_prompt.get(prompt)
-            if pred and pred.get("score", 0) > 0:
-                per_prompt_hits[prompt].append({
-                    "score": pred["score"],
-                    "instances": pred.get("instance_count", 0),
+            raw_pred = raw_results_by_prompt.get(prompt)
+            if raw_pred and raw_pred.get("score", 0) > 0:
+                raw_prompt_hits[prompt].append({
+                    "score": raw_pred["score"],
+                    "instances": raw_pred.get("instance_count", 0),
                     "image": rel_path,
                 })
             else:
-                per_prompt_misses[prompt] += 1
+                raw_prompt_misses[prompt] += 1
 
-        all_results.append((abs_path, results_by_prompt))
+            filtered_pred = filtered_results_by_prompt.get(prompt)
+            if filtered_pred and filtered_pred.get("score", 0) > 0:
+                filtered_prompt_hits[prompt].append({
+                    "score": filtered_pred["score"],
+                    "instances": filtered_pred.get("instance_count", 0),
+                    "image": rel_path,
+                })
+            else:
+                filtered_prompt_misses[prompt] += 1
+
+        all_results.append((abs_path, filtered_results_by_prompt))
         n_processed += 1
 
     elapsed = time.time() - t0
@@ -361,40 +466,71 @@ def run_json(json_path: Path, image_root: Path):
     with open(stats_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "prompt", "total_images", "hits", "misses",
-            "activation_rate", "avg_score", "avg_instances", "total_instances",
+            "prompt",
+            "total_images",
+            "raw_hits", "raw_misses", "raw_activation_rate", "raw_avg_score", "raw_avg_instances", "raw_total_instances",
+            "filtered_hits", "filtered_misses", "filtered_activation_rate", "filtered_avg_score", "filtered_avg_instances", "filtered_total_instances",
         ])
         for prompt in prompts:
             total_img = prompt_seen[prompt]
-            hits = len(per_prompt_hits.get(prompt, []))
-            misses = per_prompt_misses.get(prompt, 0)
-            scores = [h["score"] for h in per_prompt_hits.get(prompt, [])]
-            instances = [h["instances"] for h in per_prompt_hits.get(prompt, [])]
+            raw_hits = len(raw_prompt_hits.get(prompt, []))
+            raw_misses = raw_prompt_misses.get(prompt, 0)
+            raw_scores = [h["score"] for h in raw_prompt_hits.get(prompt, [])]
+            raw_instances = [h["instances"] for h in raw_prompt_hits.get(prompt, [])]
+
+            filtered_hits = len(filtered_prompt_hits.get(prompt, []))
+            filtered_misses = filtered_prompt_misses.get(prompt, 0)
+            filtered_scores = [h["score"] for h in filtered_prompt_hits.get(prompt, [])]
+            filtered_instances = [h["instances"] for h in filtered_prompt_hits.get(prompt, [])]
             writer.writerow([
                 prompt,
                 total_img,
-                hits,
-                misses,
-                round(hits / max(total_img, 1), 4),
-                round(float(np.mean(scores)), 4) if scores else 0,
-                round(float(np.mean(instances)), 2) if instances else 0,
-                sum(instances),
+                raw_hits,
+                raw_misses,
+                round(raw_hits / max(total_img, 1), 4),
+                round(float(np.mean(raw_scores)), 4) if raw_scores else 0,
+                round(float(np.mean(raw_instances)), 2) if raw_instances else 0,
+                sum(raw_instances),
+                filtered_hits,
+                filtered_misses,
+                round(filtered_hits / max(total_img, 1), 4),
+                round(float(np.mean(filtered_scores)), 4) if filtered_scores else 0,
+                round(float(np.mean(filtered_instances)), 2) if filtered_instances else 0,
+                sum(filtered_instances),
             ])
     print(f"  stats CSV:  {stats_path}")
 
     # ── 终端统计 ──
-    print(f"\n  {'Prompt':<20} {'激活率':>8} {'avg_score':>10} {'avg_inst':>9} {'总实例':>7}")
-    print("  " + "-" * 56)
+    raw_total_hits = sum(len(v) for v in raw_prompt_hits.values())
+    filtered_total_hits = sum(len(v) for v in filtered_prompt_hits.values())
+    print(f"\n  命中过滤汇总: raw={raw_total_hits} -> filtered={filtered_total_hits} (drop={raw_total_hits - filtered_total_hits})")
+    print(f"\n  {'Prompt':<20} {'raw率':>8} {'flt率':>8} {'raw_score':>10} {'flt_score':>10} {'raw_inst':>9} {'flt_inst':>9}")
+    print("  " + "-" * 82)
     for prompt in prompts:
         total_img = prompt_seen[prompt]
-        hits = len(per_prompt_hits.get(prompt, []))
-        scores = [h["score"] for h in per_prompt_hits.get(prompt, [])]
-        instances = [h["instances"] for h in per_prompt_hits.get(prompt, [])]
-        rate = hits / max(total_img, 1)
-        avg_s = float(np.mean(scores)) if scores else 0
-        avg_i = float(np.mean(instances)) if instances else 0
-        total_i = sum(instances)
-        print(f"  {prompt:<20} {rate:>7.1%} {avg_s:>10.4f} {avg_i:>9.2f} {total_i:>7}")
+        raw_hits = len(raw_prompt_hits.get(prompt, []))
+        raw_scores = [h["score"] for h in raw_prompt_hits.get(prompt, [])]
+        raw_instances = [h["instances"] for h in raw_prompt_hits.get(prompt, [])]
+        filtered_hits = len(filtered_prompt_hits.get(prompt, []))
+        filtered_scores = [h["score"] for h in filtered_prompt_hits.get(prompt, [])]
+        filtered_instances = [h["instances"] for h in filtered_prompt_hits.get(prompt, [])]
+
+        raw_rate = raw_hits / max(total_img, 1)
+        filtered_rate = filtered_hits / max(total_img, 1)
+        raw_avg_s = float(np.mean(raw_scores)) if raw_scores else 0
+        filtered_avg_s = float(np.mean(filtered_scores)) if filtered_scores else 0
+        raw_avg_i = float(np.mean(raw_instances)) if raw_instances else 0
+        filtered_avg_i = float(np.mean(filtered_instances)) if filtered_instances else 0
+
+        print(
+            f"  {prompt:<20} "
+            f"{raw_rate:>7.1%} "
+            f"{filtered_rate:>7.1%} "
+            f"{raw_avg_s:>10.4f} "
+            f"{filtered_avg_s:>10.4f} "
+            f"{raw_avg_i:>9.2f} "
+            f"{filtered_avg_i:>9.2f}"
+        )
 
     # ── 可视化 ──
     vis_dir = out_dir / "visualizations"
@@ -405,8 +541,15 @@ def run_json(json_path: Path, image_root: Path):
 # ── main ────────────────────────────────────────────────────────────
 
 def main():
+    log_runtime_device()
+
     if not CHECKPOINT.exists():
         print(f"错误: 找不到模型 {CHECKPOINT}")
+        sys.exit(1)
+    sig = inspect.signature(load_model)
+    needs_model_dir = list(sig.parameters.keys()) != ["checkpoint_path"] and "checkpoint_path" in sig.parameters
+    if needs_model_dir and not MODEL_DIR.exists():
+        print(f"错误: 找不到模型目录 {MODEL_DIR}")
         sys.exit(1)
 
     # 自动扫描 test/json/ 下所有任务 JSON
@@ -419,39 +562,48 @@ def main():
     all_jsons = [jf for jf in json_files
                  if not any(kw in jf.stem.lower() for kw in skip_keywords)]
 
+    if TASK_JSON_WHITELIST:
+        whitelist = set(TASK_JSON_WHITELIST)
+        all_jsons = [jf for jf in all_jsons if jf.name in whitelist]
+
     if not all_jsons:
         print(f"错误: {json_dir} 下没有找到任务 JSON 文件")
+        if TASK_JSON_WHITELIST:
+            print(f"  当前白名单: {TASK_JSON_WHITELIST}")
         print(f"  需要格式: [{{\"ann_id\":1, \"image_path\":\"...\", \"text_prompt\":\"...\"}}, ...]")
         sys.exit(1)
 
-    # 交互式选择 JSON
-    print(f"\n{'─'*50}")
-    print(f"{'#':<4} {'文件名':<40} {'大小':>8}")
-    print(f"{'─'*50}")
-    for i, jf in enumerate(all_jsons):
-        size_kb = jf.stat().st_size / 1024
-        print(f"{i:<4} {jf.name:<40} {size_kb:>7.0f} KB")
-    print(f"{'─'*50}")
-    print(f"a   全部运行")
-    print(f"q   退出")
-    print(f"{'─'*50}")
-
-    choice = input("选择 (编号/a/q): ").strip()
-    if choice.lower() == "q":
-        sys.exit(0)
-    elif choice.lower() == "a":
+    if AUTO_SELECT_WHITELIST and TASK_JSON_WHITELIST:
         task_jsons = all_jsons
     else:
-        idxs = [int(x.strip()) for x in choice.replace(",", " ").split() if x.strip().isdigit()]
-        task_jsons = [all_jsons[i] for i in idxs if 0 <= i < len(all_jsons)]
-        if not task_jsons:
-            print("无效选择")
-            sys.exit(1)
+        # 交互式选择 JSON
+        print(f"\n{'─'*50}")
+        print(f"{'#':<4} {'文件名':<40} {'大小':>8}")
+        print(f"{'─'*50}")
+        for i, jf in enumerate(all_jsons):
+            size_kb = jf.stat().st_size / 1024
+            print(f"{i:<4} {jf.name:<40} {size_kb:>7.0f} KB")
+        print(f"{'─'*50}")
+        print(f"a   全部运行")
+        print(f"q   退出")
+        print(f"{'─'*50}")
+
+        choice = input("选择 (编号/a/q): ").strip()
+        if choice.lower() == "q":
+            sys.exit(0)
+        elif choice.lower() == "a":
+            task_jsons = all_jsons
+        else:
+            idxs = [int(x.strip()) for x in choice.replace(",", " ").split() if x.strip().isdigit()]
+            task_jsons = [all_jsons[i] for i in idxs if 0 <= i < len(all_jsons)]
+            if not task_jsons:
+                print("无效选择")
+                sys.exit(1)
 
     print(f"\n图片根目录:   {IMAGE_ROOT}")
     print(f"预处理:       {'启用' if ENABLE_PREPROCESS else '关闭'}", end="")
     if ENABLE_PREPROCESS:
-        print(f" ({TARGET_W}×{TARGET_H}, CLAHE/降噪/锐化自适应)")
+        print(" (原始分辨率, 不做 resize, CLAHE/降噪/锐化自适应)")
     else:
         print()
     print(f"已选择 {len(task_jsons)} 个 JSON:")
