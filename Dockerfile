@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # PyTorch / CUDA / pycocotools 已由基础镜像提供，只需补充:
 #   transformers  → CLIPSegProcessor + CLIPSegForImageSegmentation
 #   opencv-python → 图像预处理 (灰度读取/反色/resize/pad)
-RUN pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir \
     transformers>=4.46 \
     opencv-python-headless>=4.8 \
     huggingface_hub
@@ -36,12 +36,12 @@ RUN echo "=== 关键文件 ===" \
     && ls -lh /raytron/code/model/sam3.pt \
     && ls -lh /raytron/code/model/config.json \
     && echo "=== Python 环境 ===" \
-    && python -c "import torch; print(f'PyTorch {torch.__version__} | CUDA: {torch.cuda.is_available()}')" \
-    && python -c "from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation; print('CLIPSeg OK')" \
-    && python -c "import cv2; print(f'OpenCV {cv2.__version__}')" \
-    && python -c "import pycocotools; print('pycocotools OK')" \
+    && python3 -c "import torch; print(f'PyTorch {torch.__version__} | CUDA: {torch.cuda.is_available()}')" \
+    && python3 -c "from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation; print('CLIPSeg OK')" \
+    && python3 -c "import cv2; print(f'OpenCV {cv2.__version__}')" \
+    && python3 -c "import pycocotools; print('pycocotools OK')" \
     && echo "=== 推理脚本语法 ===" \
-    && python -c "import py_compile; py_compile.compile('/raytron/code/inference.py', doraise=True); print('OK')" \
+    && python3 -c "import py_compile; py_compile.compile('/raytron/code/inference.py', doraise=True); print('OK')" \
     && echo "=== 构建完成 ==="
 
 WORKDIR /raytron

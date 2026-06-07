@@ -8,6 +8,7 @@ regex
 iopath>=0.1.10
 typing_extensions
 huggingface_hub
+transformers>=4.46
 einops
 pycocotools
 # 可选：如果要统计 .safetensors 权重，请额外安装 safetensors

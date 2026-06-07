@@ -19,6 +19,7 @@ CLIPSeg 模型导出 —— 打包为 Docker 提交所需的 /raytron/code/model
 """
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -32,7 +33,8 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
 BASE_MODEL_DIR = ROOT / "model" / "clipseg-rd64-refined"   # HuggingFace base 模型
 TRAINED_CKPT = ROOT / "test" / "train_output" / "clipseg_v1" / "best.pt"   # 训练好的权重
-OUTPUT_DIR = ROOT / "model" / "submit"                      # 输出目录
+OUTPUT_DIR = ROOT / "model" / "submit-clipseg"                      # 输出目录
+HF_CACHE_DIR = ROOT / "test" / ".hf_cache"
 
 # ══════════════════════════════════════════════════════════════════════
 # HuggingFace 必须文件列表（tokenizer + config）
@@ -47,6 +49,14 @@ REQUIRED_FILES = [
     "merges.txt",
     "special_tokens_map.json",
 ]
+
+
+def ensure_hf_cache():
+    """Use a repo-local HuggingFace cache to avoid user-profile permission issues."""
+    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE_DIR / "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR / "transformers"))
 
 
 def check_model_param_count(checkpoint_path: Path) -> int:
@@ -143,6 +153,7 @@ def main():
         logger.error(f"Base 模型不存在: {BASE_MODEL_DIR}")
         sys.exit(1)
 
+    ensure_hf_cache()
     export()
 
 

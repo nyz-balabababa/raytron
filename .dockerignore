@@ -2,6 +2,8 @@ __pycache__
 *.pyc
 .git
 .vscode
+.hf_cache
+test
 test/preprocessed
 test/preprocessed_inference
 test/prompt_test_output
@@ -9,3 +11,6 @@ docs
 data
 *.csv
 *.md
+*.tar
+*.tar.gz
+*.zip

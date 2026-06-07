@@ -4,7 +4,6 @@
 # 安装方式 (新建 conda 环境):
 #   conda create -n raytron python=3.10 -y
 #   conda activate raytron
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 #   pip install -r require_4090.txt
 #
 # 导出日期: 2026-06-02
@@ -13,9 +12,16 @@
 #
 # ⚠️ 与 5060 版 (requirements.txt) 的区别:
 #   - PyTorch 从 cu128 dev 改为 cu124 stable (4090 不需要 Blackwell 专属驱动)
-#   - torch / torchvision / torchaudio 不在此文件中，请在安装前手动执行 pip install
-#   - 其余所有依赖版本完全一致，确保跨机器可复现
+#   - 这里直接把 cu124 版 torch / torchvision / torchaudio 也写进文件，避免漏装
+#   - 其余依赖尽量对齐当前 rayton 环境中已经跑通的版本组合
 # =============================================================================
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# ── PyTorch 生态 (CUDA 12.4 stable) ──
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
 
 # ── 核心训练/推理 ──
 ultralytics==8.4.58
@@ -32,9 +38,11 @@ ftfy==6.1.1
 regex==2026.5.9
 
 # ── HuggingFace Hub (CLIPSeg 等模型下载) ──
-huggingface_hub==1.8.0
+transformers==4.46.3
+huggingface_hub==0.36.2
 hf-xet==1.5.0
 safetensors==0.7.0
+tokenizers==0.20.3
 filelock==3.19.1
 fsspec==2025.10.0
 

@@ -21,9 +21,14 @@
 | **文本条件分割** | 图像 + "car" → mask，同图换 "vehicle" 应输出相似结果 |
 | **prompt 泛化** | 训练时 50% 概率替换 prompt，测试原始 prompt 能否泛化 |
 | **IR 域视觉编码** | CLIP 视觉编码器 lr=1e-5 微调 vs 冻结 |
-| **空掩码** | 保留全零 mask 样本，模型需学会"找不到就输出全零" |
+| **空掩码 / 负样本** | 保留 `hit=false` 样本，模型需学会"找不到就输出全零" |
 | **噪声鲁棒** | 逐样本置信度加权 + loss weight floor + warmup |
-| **类别不平衡** | animal 3×、computer 2× 过采样 + LOSS_WEIGHT_FLOOR=0.7 |
+| **边界噪声抑制** | 对伪标签边界环带做 ignore，不把残缺边界当硬真值 |
+| **类别不平衡** | 主线五类中仅对 `animal` 做 3× 过采样 + LOSS_WEIGHT_FLOOR=0.7 |
+
+> 说明：本文保留了最初 `v1` 实验的背景，但当前仓库中的训练脚本已经切到**五类主线版本**。  
+> 当前主线类别为：`person / car / building / tree / animal`。  
+> `computer` 已移出主线，转入尾类专项，不再参与当前 `CLIPSeg` 主训练配置。
 
 ---
 
@@ -66,11 +71,11 @@
 |------|-----|------|
 | 训练集 | 39,104 张 | `train_list.txt` |
 | 验证集 | 4,524 张 | `val_list.txt` |
-| 训练伪标签 | SAM3 Json1 | `pred_train_tasks.json` |
-| 验证伪标签 | SAM3 Json1 | `pred_val_tasks1.json` |
-| 类别 | 6 类 | person/car/building/tree/animal/computer |
+| 训练伪标签 | 官方 SAM3 teacher，新链路输出 | `pred_train_tasks.json` |
+| 验证伪标签 | 官方 SAM3 teacher，新链路输出 | `pred_val_tasks1.json` |
+| 类别 | 5 类 | person/car/building/tree/animal |
 
-### 3.2 分级置信度过滤
+### 3.2 teacher 输出阈值与训练侧过滤
 
 | 类别 | 阈值 | 理由 |
 |------|------|------|
@@ -79,24 +84,36 @@
 | building | 0.70 | p25=0.731 |
 | tree | 0.60 | p25=0.628，降低阈值保留样本 |
 | animal | 0.60 | p25=0.653，稀有类降低门槛 |
-| computer | 0.55 | 仅 151 样本，能用的都保留 |
+
+当前版本有两点和早期 `v1` 不同：
+
+1. **teacher 端已经按类阈值过滤后再写入 `pred_json`**
+2. **训练端默认不再重复做一次 score 硬过滤**
+
+也就是当前 `clipseg_train.py` 中：
+
+- `PROMPT_THRESHOLDS`：与 teacher 输出阈值保持一致
+- `APPLY_SCORE_FILTER = False`：默认关闭二次硬过滤，避免重复丢样本
 
 ### 3.3 图像预处理管线
 
-`__getitem__` 中的处理顺序：
+当前训练脚本已经和 `generate_sam3_labels.py` 对齐，`__getitem__` 中的处理顺序为：
 
 ```
-1. cv2.imread 灰度读取
+1. 彩图读取 → 伪彩图统一转灰度
 2. 反色统一：黑热（热目标=暗）→ 白热（热目标=亮）
    - 文件名含 "blackHot" → 强制反色 (255 - gray)
    - 直方图偏度 < -0.3（左偏）→ 反色
    - 均值 > 200 且非 "vis" → 兜底反色
-3. 等比例缩放：长边缩放到 1024
-4. padding：补零到 1024×1024 正方形
-5. GRAY → RGB：灰度复制为 3 通道
-6. 水平翻转：50% 概率
-7. [0,255] → [0,1] 归一化
-8. CLIP 标准化：(x - mean) / std
+3. CLAHE：低对比图自适应增强
+4. 去噪：中值 / 双边滤波
+5. 锐化：对低清晰度图补强边缘
+6. 等比例缩放：长边缩放到 1024
+7. padding：补零到 1024×1024 正方形
+8. GRAY → RGB：灰度复制为 3 通道
+9. 水平翻转：50% 概率
+10. [0,255] → [0,1] 归一化
+11. CLIP 标准化：(x - mean) / std
 ```
 
 ### 3.4 RLE 掩码缓存
@@ -107,27 +124,34 @@ RLE 只在首次运行时解码一次，结果存为 PNG 到磁盘（`test/train
 
 ### 3.5 样本构成
 
-每张图每个命中 prompt 独立成一个样本：
+当前版本不再只保留正样本。每张图每个 prompt 都可能形成一个样本：
 
 ```
 img_001 + "car"      → mask_car      (1 条样本)
 img_001 + "person"   → mask_person   (1 条样本)
 img_001 + "tree"     → mask_tree     (1 条样本)
+img_001 + "animal"   → 全零 mask     (1 条负样本，若 teacher 判定 hit=false 且被采样保留)
 ```
 
-训练集约 95K 条样本，验证集约 10K 条。
+当前训练脚本的负样本策略：
+
+- `INCLUDE_NEGATIVE_SAMPLES = True`
+- 训练集：`NEGATIVE_SAMPLE_RATIO = 0.25`
+- 验证集：保留全部 `hit=false`，用于评估拒识能力
+- 负样本权重：`NEGATIVE_SAMPLE_WEIGHT = 0.30`
 
 ### 3.6 类别过采样（仅训练集）
 
 | 类别 | 倍数 | 原始样本 | 过采样后 |
 |------|------|---------|---------|
 | animal | 3× | ~1,500 | ~4,500 |
-| computer | 2× | ~150 | ~300 |
-| 其余 4 类 | 1× | ~73,000 | ~73,000 |
+| 其余 4 类 | 1× | 主体样本 | 不变 |
 
-### 3.7 空掩码处理
+### 3.7 空掩码与异常样本处理
 
-SAM3 未找到目标时 RLE 解码为全零 mask。这些样本保留在数据集中——模型需要学习"找不到就输出全零"，这对 zero-shot 场景至关重要。
+- `hit=false`：作为显式负样本进入训练/验证
+- `hit=true` 但 RLE 解码后为空：直接跳过，不再混入训练
+- 图片缺失或无法读取：直接跳过，不再用全黑图兜底
 
 ---
 
@@ -150,16 +174,31 @@ loss = BCE_WEIGHT × mean(w × BCE_per_sample)
 
 | 类别 | avg score | 有效权重 | 效果 |
 |------|-----------|---------|------|
-| car | 0.915 | ~0.92 | 几乎满权，监督信号最强 |
-| building | 0.841 | ~0.84 | 正常 |
-| person | 0.811 | ~0.81 | 正常 |
-| animal | 0.812 | ~0.81 | 正常，配合 3× 过采样 |
-| tree | 0.723 | ~0.72~0.78 | 低分自动降权，噪声抑制 |
-| computer | 0.736 | ~0.74~0.79 | floor 保护，最小权重 ≥ 0.7 |
+| car | 高 | 高 | 几乎满权，监督信号最强 |
+| building | 中高 | 中高 | 正常 |
+| person | 中高 | 中高 | 正常 |
+| animal | 中高 | 中高 | 配合 3× 过采样 |
+| tree | 中低 | 受 floor 保护 | 噪声抑制 |
 
 ### 4.4 LOSS_WEIGHT_FLOOR
 
-设为 0.7，确保 computer/tree 的弱信号至少保留 70% 的梯度贡献，不会因降权过度而学不动。
+设为 0.7，确保 `tree` 和其他弱样本至少保留 70% 的梯度贡献，不会因降权过度而学不动。  
+负样本单独使用 `NEGATIVE_SAMPLE_WEIGHT = 0.30`，避免大量空标签过早压制正样本学习。
+
+### 4.5 边界弱监督
+
+当前 `clipseg_train.py` 已接入边界弱监督：
+
+- 对正样本伪标签边界构造 `ignore band`
+- BCE 和 Dice 只在 `valid_mask=1` 的区域计算
+- 边界环带不参与损失
+- 极小目标（面积 < `64` 像素）不启用该策略，避免把 tiny object 直接抹掉
+
+当前默认：
+
+- `ENABLE_BOUNDARY_WEAK_SUPERVISION = True`
+- `BOUNDARY_IGNORE_WIDTH = 1`
+- `BOUNDARY_IGNORE_MIN_AREA = 64`
 
 ---
 
@@ -174,7 +213,6 @@ loss = BCE_WEIGHT × mean(w × BCE_per_sample)
 | building | "buildings, houses, or structures" / "any building or architectural structure" / "houses and buildings" |
 | tree | "trees, plants, bushes, or any vegetation" / "trees and vegetation" / "plants, bushes, and trees" |
 | animal | "animal, wildlife" / "any animal or wildlife creature" / "animals in the wild" |
-| computer | **不增强**（样本太少） |
 
 ---
 
@@ -182,14 +220,18 @@ loss = BCE_WEIGHT × mean(w × BCE_per_sample)
 
 ```python
 # ── 数据 ──
-CLASSES = ["person", "car", "building", "tree", "animal", "computer"]
-CONF_FILTER = {person:0.70, car:0.70, building:0.70, tree:0.60, animal:0.60, computer:0.55}
-RARE_OVERSAMPLE = {animal:3, computer:2}
+CLASSES = ["person", "car", "building", "tree", "animal"]
+PROMPT_THRESHOLDS = {person:0.70, car:0.70, building:0.70, tree:0.60, animal:0.60}
+APPLY_SCORE_FILTER = False
+RARE_OVERSAMPLE = {animal:3}
+INCLUDE_NEGATIVE_SAMPLES = True
+NEGATIVE_SAMPLE_RATIO = 0.25
+NEGATIVE_SAMPLE_WEIGHT = 0.30
 
 # ── 训练 ──
 IMG_SIZE = 1024          # 等比例缩放 + pad
 BATCH = 4
-EPOCHS = 200             # 单阶段
+EPOCHS = 25
 SEED = 42
 
 # ── 优化器 ──
@@ -226,12 +268,12 @@ PROMPT_AUG_PROB = 0.5
 ### 7.1 单阶段 + Warmup + Cosine
 
 ```
-200 epoch，单次训练:
+25 epoch，单次训练:
 
 Epoch 1-2:   线性 warmup，lr 从 1e-6 → 1e-4
-Epoch 3-200: 余弦退火，lr 从 1e-4 → 1e-6
+Epoch 3-25:  余弦退火，lr 从 1e-4 → 1e-6
 
-总 steps = 200 × len(train_loader)
+总 steps = 25 × len(train_loader)
 warmup steps = 2 × len(train_loader)
 
          lr
@@ -240,7 +282,7 @@ warmup steps = 2 × len(train_loader)
          │      ╱      ╲___
     1e-6 ┤─────╱            ╲___
          └──────────────────────→ epoch
-         0   2                 200
+         0   2                  25
 ```
 
 不用两阶段——YOLO 的分阶段是为了开关 `copy_paste`，CLIPSeg 无此概念。warmup 前 2 epoch 稳定训练初期，余弦退火自动衰减。
@@ -271,9 +313,9 @@ checkpoint = {
 | 指标 | 计算方式 |
 |------|---------|
 | Training Loss | 逐样本置信度加权 BCE + Dice 均值 |
-| Val mIoU | 验证集平均 IoU |
-| Val Dice | 验证集平均 Dice |
-| Per-class IoU | 6 类各自的 IoU |
+| Val mIoU | 验证集平均 IoU（按类阈值） |
+| Val Dice | 验证集平均 Dice（按类阈值） |
+| Per-class IoU | 5 类各自的 IoU |
 | Learning Rate | 当前 lr |
 | Sample Overlay | 验证图 + GT(红) + Pred(蓝) 叠加 |
 
@@ -285,7 +327,7 @@ checkpoint = {
 
 **3. Val Dice（品红）** — 与 mIoU 相关但更鲁棒，对类别不平衡不敏感。两者背离说明空掩码占比异常
 
-**4. Per-Class IoU（6 色）** — 定位弱类：全部低→容量不够；某类低→不平衡/噪声/增强问题
+**4. Per-Class IoU（5 类）** — 定位弱类：全部低→容量不够；某类低→不平衡/噪声/增强问题
 
 **5. Learning Rate（红色）** — 确认 warmup+cosine 是否符合预期，LR 接近 0 但 loss 仍降→可加 epoch
 

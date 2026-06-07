@@ -4,34 +4,45 @@ CLIPSeg 训练配置 —— 自包含，不再继承 config_common。
 """
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parents[3]
 
 # ══════════════════════════════════════════════════════════════════════
 # 数据
 # ══════════════════════════════════════════════════════════════════════
 
-CLASSES = ["person", "car", "building", "tree", "animal", "computer"]
+CLASSES = ["person", "car", "building", "tree", "animal"]
 PRED_JSON = ROOT / "test" / "prompt_test_output" / "train_tasks" / "pred_train_tasks.json"
 VAL_PRED_JSON = ROOT / "test" / "prompt_test_output" / "val_tasks1" / "pred_val_tasks1.json"
 TRAIN_LIST = ROOT / "test" / "train_list.txt"
 VAL_LIST = ROOT / "test" / "val_list.txt"
 IMAGE_ROOT = ROOT
+USE_MANIFEST = False
+MANIFEST_JSON = ROOT / "test" / "label_analysis" / "train_manifest.json"
 
-# 伪标签分级过滤阈值
-CONF_FILTER = {
+# teacher 伪标签输出阈值；训练验证与其保持一致
+PROMPT_THRESHOLDS = {
     "person":   0.70,
     "car":      0.70,
     "building": 0.70,
     "tree":     0.60,
     "animal":   0.60,
-    "computer": 0.55,
 }
+
+# 是否在训练集构建时按 score 再做一次硬过滤。
+# 当前 teacher 端已经按类阈值筛过，默认关闭，避免重复丢样本。
+APPLY_SCORE_FILTER = False
+CONF_FILTER = PROMPT_THRESHOLDS
+VAL_THRESHOLDS = PROMPT_THRESHOLDS
 
 # 稀有类过采样倍数（仅训练集）
 RARE_OVERSAMPLE = {
     "animal": 3,
-    "computer": 2,
 }
+
+# 是否纳入 hit=false 的负样本；用较低比例先补拒识能力
+INCLUDE_NEGATIVE_SAMPLES = True
+NEGATIVE_SAMPLE_RATIO = 0.25
+NEGATIVE_SAMPLE_WEIGHT = 0.30
 
 # ══════════════════════════════════════════════════════════════════════
 # 模型
@@ -68,7 +79,12 @@ WARMUP_START_FACTOR = 0.01      # warmup 起点 lr = lr0 × 0.01
 
 BCE_WEIGHT = 1.0
 DICE_WEIGHT = 1.0
-LOSS_WEIGHT_FLOOR = 0.7          # 逐样本置信度加权下限（保护 computer/animal）
+LOSS_WEIGHT_FLOOR = 0.7          # 逐样本置信度加权下限（保护弱样本不被过度降权）
+
+# 边界弱监督：对伪标签边界环带做 ignore，不把残缺边界当硬真值
+ENABLE_BOUNDARY_WEAK_SUPERVISION = True
+BOUNDARY_IGNORE_WIDTH = 1        # 1024 pad 尺度下的边界忽略半径（像素）
+BOUNDARY_IGNORE_MIN_AREA = 64    # 太小的目标不做边界忽略，避免极小目标被抹掉
 
 # ══════════════════════════════════════════════════════════════════════
 # 数据增强
@@ -79,6 +95,13 @@ GRAY2RGB = True                 # 灰度复制为 3 通道
 # 反色统一：黑热（热目标=暗）→ 白热（热目标=亮）
 BLACKHOT_SKEW_THRESH = -0.3     # 直方图偏度 < 此值判定为黑热
 BLACKHOT_MEAN_THRESH = 200      # 均值 > 此值且非 vis 图，兜底反色
+PSEUDO_COLOR_SAT_THRESH = 60.0  # 与 teacher 端一致，检测伪彩图
+STD_LOW = 35.0                  # teacher 端低对比增强阈值
+STD_MID = 50.0
+NOISE_HIGH = 12.0               # teacher 端噪声估计阈值
+NOISE_MED = 8.0
+BLUR_LOW = 150.0                # teacher 端清晰度阈值
+BLUR_MID = 300.0
 # CLIP 预训练时的均值/标准差（RGB 三通道）
 CLIP_MEAN = [0.48145466, 0.52048427, 0.45053169]
 CLIP_STD  = [0.21028575, 0.23535925, 0.22184163]
@@ -94,28 +117,48 @@ PROMPT_AUGMENTATIONS = {
         "person, human, people",
         "a person walking or standing",
         "people in the scene",
+        # 中文 + 中英混合短语
+        "行人, 人, 人员",
+        "一个行走或站立的人",
+        "person 行人 human 人员",
+        "场景中的人",
     ],
     "car": [
         "cars, vehicles, trucks, or any automobiles",
         "a car or vehicle on the road",
         "vehicles including cars and trucks",
+        # 中文 + 中英混合短语
+        "车辆, 汽车, 车",
+        "一辆在路上的车",
+        "car 汽车 vehicle 车辆",
     ],
     "building": [
         "buildings, houses, or structures",
         "any building or architectural structure",
         "houses and buildings",
+        # 中文 + 中英混合短语
+        "建筑, 楼房, 房屋",
+        "建筑物或房屋结构",
+        "building 建筑 house 房屋",
     ],
     "tree": [
         "trees, plants, bushes, or any vegetation",
         "trees and vegetation",
         "plants, bushes, and trees",
+        # 中文 + 中英混合短语
+        "树, 树木, 植物, 灌木",
+        "树木和植被",
+        "tree 树木 plant 植物",
     ],
     "animal": [
         "animal, wildlife",
         "any animal or wildlife creature",
         "animals in the wild",
+        # 中文 + 中英混合短语
+        "动物, 野生动物",
+        "野外出现的动物",
+        "animal 动物 wildlife 野生动物",
     ],
-    "computer": [],
 }
 
 # ══════════════════════════════════════════════════════════════════════

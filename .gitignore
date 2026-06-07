@@ -2,6 +2,7 @@
 model/
 sam3/
 assets/
+src/hanxue/weights/
 
 # ── 训练数据（5万+图片，太大）──
 test/data1/
@@ -17,8 +18,13 @@ test/train_output/
 test/yolo_world_dataset/
 test/yolo_world_dataset_v2/
 test/yolo_world_dataset_v3/
+test/yolo_world_dataset_manifest5_v1/
 test/yolo_dataset/
 test/preprocessed/
+test/inference_eval/
+test/label_analysis/
+test/sam3_label_output/
+test/sam3_label_old/
 
 # ── test 下其他生成文件 ──
 test/txt/
@@ -43,6 +49,9 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.hf_cache/
+test/.hf_cache/
+.tmp*/
 
 # ── Claude ──
 .claude/
