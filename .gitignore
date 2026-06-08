@@ -3,6 +3,7 @@ model/
 sam3/
 assets/
 src/hanxue/weights/
+src/zmq/
 
 # ── 训练数据（5万+图片，太大）──
 test/data1/

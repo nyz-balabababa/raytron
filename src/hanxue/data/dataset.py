@@ -413,6 +413,8 @@ class InfraredPromptDataset(Dataset):
             "attention_mask": encoded["attention_mask"][0],
             "sample_weight": torch.tensor(float(sample["sample_weight"]), dtype=torch.float32),
             "prompt": sample["prompt"],
+            "class_name": sample["prompt"],
+            "orig_prompt": sample["prompt"],
             "prompt_text": prompt,
             "image_path": sample["image_path"],
             "is_positive": sample["is_positive"],

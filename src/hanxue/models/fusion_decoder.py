@@ -25,6 +25,8 @@ class FiLMFusionDecoder(nn.Module):
 
         # 文本特征映射为 FiLM 的 gamma 和 beta
         self.film_projection = nn.Linear(text_dim, image_dim * 2)
+        nn.init.zeros_(self.film_projection.weight)
+        nn.init.zeros_(self.film_projection.bias)
 
         # 保留你原来的层名，避免已有 checkpoint 因层名变化而加载失败
         self.conv_after_fusion = nn.Sequential(

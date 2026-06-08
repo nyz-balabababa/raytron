@@ -5,7 +5,9 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from config_hanxue import EFFICIENT_SAM_CKPT
 
 # 确保可以导入项目根目录下的 efficient_sam 包
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,39 +74,68 @@ class PureImageEncoder(nn.Module):
 
     def __init__(
         self,
-        checkpoint_path="weights/efficient_sam/efficient_sam_vitt.pt",
+        checkpoint_path=None,
         freeze=False
     ):
         super().__init__()
 
+        if checkpoint_path is None:
+            checkpoint_path = EFFICIENT_SAM_CKPT
         checkpoint_path = resolve_weight_path(checkpoint_path)
 
         full_sam_model = build_efficient_sam_vitt()
 
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            state_dict = extract_state_dict(checkpoint)
-            state_dict = strip_module_prefix(state_dict)
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"未找到 EfficientSAM 权重: {checkpoint_path}")
 
-            missing_keys, unexpected_keys = full_sam_model.load_state_dict(
-                state_dict,
-                strict=False
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = extract_state_dict(checkpoint)
+        state_dict = strip_module_prefix(state_dict)
+
+        missing_keys, unexpected_keys = full_sam_model.load_state_dict(
+            state_dict,
+            strict=False
+        )
+
+        print(f"✅ 已加载 EfficientSAM 权重: {checkpoint_path}")
+
+        if len(missing_keys) > 0:
+            print(f"[EfficientSAM 警告] missing_keys 数量: {len(missing_keys)}")
+            for k in missing_keys[:20]:
+                print("  MISSING:", k)
+
+        if len(unexpected_keys) > 0:
+            print(f"[EfficientSAM 警告] unexpected_keys 数量: {len(unexpected_keys)}")
+            for k in unexpected_keys[:20]:
+                print("  UNEXPECTED:", k)
+
+        image_missing = [
+            k for k in missing_keys
+            if k.startswith("image_encoder.")
+        ]
+        image_unexpected = [
+            k for k in unexpected_keys
+            if k.startswith("image_encoder.")
+        ]
+
+        if len(image_missing) > 0:
+            print(
+                f"[严重警告] EfficientSAM image_encoder missing_keys 数量: "
+                f"{len(image_missing)}"
             )
+            for k in image_missing[:30]:
+                print("  IMAGE_MISSING:", k)
 
-            print(f"✅ 已加载 EfficientSAM 权重: {checkpoint_path}")
+        if len(image_unexpected) > 0:
+            print(
+                f"[严重警告] EfficientSAM image_encoder unexpected_keys 数量: "
+                f"{len(image_unexpected)}"
+            )
+            for k in image_unexpected[:30]:
+                print("  IMAGE_UNEXPECTED:", k)
 
-            if len(missing_keys) > 0:
-                print(f"[EfficientSAM 警告] missing_keys 数量: {len(missing_keys)}")
-                for k in missing_keys[:20]:
-                    print("  MISSING:", k)
-
-            if len(unexpected_keys) > 0:
-                print(f"[EfficientSAM 警告] unexpected_keys 数量: {len(unexpected_keys)}")
-                for k in unexpected_keys[:20]:
-                    print("  UNEXPECTED:", k)
-        else:
-            print(f"⚠️ 未找到 EfficientSAM 权重: {checkpoint_path}")
-            print("⚠️ 将使用随机初始化的 EfficientSAM image_encoder。")
+        if len(image_missing) > 50:
+            raise RuntimeError("EfficientSAM image_encoder 权重大量缺失，停止训练。")
 
         self.image_encoder = full_sam_model.image_encoder
         self.register_buffer(
@@ -124,6 +155,8 @@ class PureImageEncoder(nn.Module):
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
 
+        self._resize_warned = False
+
     def forward(self, x):
         """
         参数:
@@ -137,6 +170,22 @@ class PureImageEncoder(nn.Module):
 
         if x.size(1) != 3:
             raise ValueError(f"输入图像通道数应为 3，当前为: {x.size(1)}")
+
+        expected_size = int(self.image_encoder.img_size)
+        if x.size(2) != expected_size or x.size(3) != expected_size:
+            if not self._resize_warned:
+                print(
+                    f"[PureImageEncoder] 输入尺寸 {tuple(x.shape[-2:])} "
+                    f"与 EfficientSAM 期望尺寸 {(expected_size, expected_size)} 不一致，"
+                    "将自动插值到 backbone 输入尺寸。"
+                )
+                self._resize_warned = True
+            x = F.interpolate(
+                x,
+                size=(expected_size, expected_size),
+                mode="bilinear",
+                align_corners=False,
+            )
 
         x = (x - self.pixel_mean.to(device=x.device, dtype=x.dtype)) / self.pixel_std.to(
             device=x.device, dtype=x.dtype

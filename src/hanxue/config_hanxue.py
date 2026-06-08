@@ -5,17 +5,18 @@ ROOT = Path(__file__).resolve().parents[2]
 HANXUE_ROOT = Path(__file__).resolve().parent
 
 # 数据
-CLASSES = ["person", "car", "building", "tree", "animal"]
+CLASSES = ["person", "car", "building", "tree", "animal", "computer"]
 PROMPT_THRESHOLDS = {
     "person": 0.70,
     "car": 0.70,
     "building": 0.70,
     "tree": 0.60,
     "animal": 0.60,
+    "computer": 0.60,
 }
 
-TRAIN_PRED_JSON = ROOT / "test" / "prompt_test_output" / "train_tasks" / "pred_train_tasks.json"
-VAL_PRED_JSON = ROOT / "test" / "prompt_test_output" / "val_tasks1" / "pred_val_tasks1.json"
+TRAIN_PRED_JSON = ROOT / "test" / "sam3_label_old" / "train_tasks" / "pred_train_tasks.json"
+VAL_PRED_JSON = ROOT / "test" / "sam3_label_old" / "val_tasks1" / "pred_val_tasks1.json"
 TRAIN_LIST = ROOT / "test" / "train_list.txt"
 VAL_LIST = ROOT / "test" / "val_list.txt"
 IMAGE_ROOT = ROOT
@@ -30,15 +31,16 @@ VAL_THRESHOLDS = PROMPT_THRESHOLDS
 # 稀有类过采样倍数（仅训练集）
 RARE_OVERSAMPLE = {
     "animal": 3,
+    "computer": 3,
 }
 
 # 是否纳入 hit=false 的负样本；用较低比例先补拒识能力
 INCLUDE_NEGATIVE_SAMPLES = True
-NEGATIVE_SAMPLE_RATIO = 0.25
+NEGATIVE_SAMPLE_RATIO = 0.15
 NEGATIVE_SAMPLE_WEIGHT = 0.30
 
 # 训练
-IMG_SIZE = 1024
+IMG_SIZE = 768
 BATCH = 4
 EPOCHS = 25
 WORKERS = 4
@@ -58,7 +60,18 @@ HFLIP_PROB = 0.5
 
 BCE_WEIGHT = 1.0
 DICE_WEIGHT = 1.0
-FOCAL_WEIGHT = 1.5
+FOCAL_WEIGHT = 0.0
+FOCAL_GAMMA = 1.5
+FOCAL_NEG_FACTOR = 0.25
+FOCAL_POS_FACTOR = 1.0
+CLASS_FOCAL_WEIGHT = {
+    "person": 0.25,
+    "car": 0.0,
+    "building": 0.55,
+    "tree": 0.55,
+    "animal": 0.45,
+    "computer": 0.60,
+}
 
 # 图像增强/预处理
 PROMPT_AUG_PROB = 0.5
@@ -119,8 +132,31 @@ PROMPT_AUGMENTATIONS = {
         "野外出现的动物",
         "animal 动物 wildlife 野生动物",
     ],
+    "computer": [
+        "computer",
+        "computer monitor",
+        "screen, computer, display",
+        "monitor or display screen",
+        "电脑, 显示器, 屏幕",
+        "电脑设备或显示器",
+        "computer 电脑 monitor 显示器 screen 屏幕",
+    ],
 }
 
 # 输出
 PROJECT = ROOT / "test" / "train_output"
-RUN_NAME = "hanxue_v1"
+RUN_NAME = "efficientsam_easy_6cls_v1"
+
+
+REQUIRED_PATHS = [
+    TRAIN_PRED_JSON,
+    VAL_PRED_JSON,
+    TRAIN_LIST,
+    VAL_LIST,
+    TOKENIZER_DIR,
+    EFFICIENT_SAM_CKPT,
+]
+
+for required_path in REQUIRED_PATHS:
+    if not required_path.exists():
+        raise FileNotFoundError(f"hanxue 配置路径不存在: {required_path}")

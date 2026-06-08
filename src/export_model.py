@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 # ── 路径配置 ──
 ROOT = Path(__file__).resolve().parent.parent
 BASE_MODEL_DIR = ROOT / "model" / "clipseg-rd64-refined"   # HuggingFace base 模型
-TRAINED_CKPT = ROOT / "test" / "train_output" / "clipseg_v1" / "best.pt"   # 训练好的权重
-OUTPUT_DIR = ROOT / "model" / "submit-clipseg"                      # 输出目录
+TRAINED_CKPT = ROOT / "test" / "train_output" / "clipseg_v2" / "best.pt"   # 训练好的权重
+OUTPUT_DIR = ROOT / "model" / "submit-clipseg-v2"                      # 输出目录
 HF_CACHE_DIR = ROOT / "test" / ".hf_cache"
 
 # ══════════════════════════════════════════════════════════════════════

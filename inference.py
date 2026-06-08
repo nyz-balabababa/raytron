@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-SAM3 推理脚本
-基于 test_task.json 的文本提示进行 SAM3 推理，输出比赛提交格式 predictions.json。
+CLIPSeg 提交推理脚本
+基于 test_tasks.json 的文本提示进行推理，输出比赛提交格式 predictions.json。
 
 使用方式：
 1. 本文件顶部的 DEFAULT_* 常量不可修改
-2. 运行 `python inference.py`
+2. 运行 `python3 /raytron/code/inference.py`
 """
 
 import json
 import os
-import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
+from tqdm import tqdm
 
+os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent / ".hf_cache"))
 
-from sam3.model_builder import build_sam3_image_model
-from sam3.model.sam3_image_processor import Sam3Processor
+from transformers import CLIPSegConfig, CLIPSegForImageSegmentation, CLIPSegProcessor
 
 try:
     from pycocotools import mask as maskUtils
@@ -34,20 +35,100 @@ except ImportError:
 DEFAULT_TASKS = "/raytron/test/test_tasks.json"
 DEFAULT_IMAGE_ROOT = "/raytron/test/"
 DEFAULT_OUTPUT_PATH = "/raytron/test/predictions.json"
+DEFAULT_MODEL_DIR = "/raytron/code/model"
 DEFAULT_CHECKPOINT_PATH = "/raytron/code/model/sam3.pt"
-DEFAULT_CONF_THRESHOLD = 0.01
+DEFAULT_MASK_THRESHOLD = 0.5
+CLASS_MASK_THRESHOLDS = {
+    "person": 0.65,
+    "car": 0.65,
+    "building": 0.68,
+    "tree": 0.56,
+    "animal": 0.55,
+    "computer": 0.55,
+}
+
+DEFAULT_FALLBACK_IMG_SIZE = 352
+PROMPT_BATCH_SIZE = 8
+BLACKHOT_SKEW_THRESH = -0.3
+BLACKHOT_MEAN_THRESH = 200.0
+PSEUDO_COLOR_SAT_THRESH = 60.0
+STD_LOW = 35.0
+STD_MID = 50.0
+NOISE_HIGH = 12.0
+NOISE_MED = 8.0
+BLUR_LOW = 150.0
+BLUR_MID = 300.0
+CLIP_MEAN = [0.48145466, 0.52048427, 0.45053169]
+CLIP_STD = [0.21028575, 0.23535925, 0.22184163]
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_model(checkpoint_path: Optional[str]):
+def ensure_hf_cache() -> None:
+    """Use a writable local cache inside the container."""
+    hf_home = os.environ.get("HF_HOME", "/tmp/huggingface")
+    os.makedirs(hf_home, exist_ok=True)
+    os.environ.setdefault("HF_HOME", hf_home)
+
+
+def load_model(
+    model_dir: str = DEFAULT_MODEL_DIR,
+    checkpoint_path: Optional[str] = DEFAULT_CHECKPOINT_PATH,
+) -> Tuple[CLIPSegForImageSegmentation, CLIPSegProcessor, int]:
+    ensure_hf_cache()
+
+    model_dir_path = Path(model_dir)
+    if not model_dir_path.exists():
+        raise FileNotFoundError(f"模型目录不存在: {model_dir}")
+
+    processor = CLIPSegProcessor.from_pretrained(str(model_dir_path))
+
+    config_path = model_dir_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"缺少 CLIPSeg 配置文件: {config_path}")
+
     if checkpoint_path and Path(checkpoint_path).exists():
-        model = build_sam3_image_model(checkpoint_path=checkpoint_path, device=DEVICE)
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        elif "model" in ckpt:
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
     else:
-        model = build_sam3_image_model(device=DEVICE)
-    processor = Sam3Processor(model=model, device=DEVICE)
-    return model, processor
+        raise FileNotFoundError(f"缺少模型权重文件: {checkpoint_path}")
+
+    config = CLIPSegConfig.from_pretrained(str(model_dir_path))
+    processor_size = getattr(processor.image_processor, "size", None)
+    processor_img_size = None
+    if isinstance(processor_size, dict):
+        processor_img_size = int(processor_size.get("height") or processor_size.get("shortest_edge") or 0)
+    elif isinstance(processor_size, int):
+        processor_img_size = int(processor_size)
+    model_img_size = int(getattr(config.vision_config, "image_size", 0) or 0)
+    pos_embed = state_dict.get("clip.vision_model.embeddings.position_embedding.weight")
+    patch_size = int(getattr(config.vision_config, "patch_size", 16) or 16)
+    if pos_embed is not None and getattr(pos_embed, "ndim", 0) == 2:
+        token_count = int(pos_embed.shape[0])
+        grid_tokens = max(token_count - 1, 1)
+        grid_size = int(round(grid_tokens ** 0.5))
+        if grid_size * grid_size + 1 == token_count:
+            model_img_size = grid_size * patch_size
+            config.vision_config.image_size = model_img_size
+    elif processor_img_size and processor_img_size != model_img_size:
+        config.vision_config.image_size = processor_img_size
+        model_img_size = processor_img_size
+    model = CLIPSegForImageSegmentation(config)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"警告: checkpoint 缺少 {len(missing)} 个参数")
+    if unexpected:
+        print(f"警告: checkpoint 多出 {len(unexpected)} 个参数")
+
+    model = model.to(DEVICE)
+    model.eval()
+    return model, processor, int(model_img_size or processor_img_size or DEFAULT_FALLBACK_IMG_SIZE)
 
 
 def count_model_params(model) -> Dict[str, Any]:
@@ -103,77 +184,205 @@ def build_empty_rle(height: int, width: int) -> Dict[str, Any]:
     return mask_to_rle(np.zeros((height, width), dtype=np.uint8))
 
 
-def normalize_mask(mask_tensor: torch.Tensor) -> np.ndarray:
-    mask = mask_tensor.detach().cpu().numpy()
-    if mask.ndim == 3:
-        mask = mask[0]
-    return (mask > 0).astype(np.uint8)
+def resolve_image_path(image_root: str, image_rel_path: str) -> str:
+    image_rel_path = image_rel_path.replace("\\", "/")
+    direct = os.path.join(image_root, image_rel_path)
+    if os.path.exists(direct):
+        return direct
+
+    if image_rel_path.startswith("test/"):
+        stripped = os.path.join(image_root, image_rel_path[5:])
+        if os.path.exists(stripped):
+            return stripped
+
+    prefixed = os.path.join(image_root, "test", image_rel_path)
+    if os.path.exists(prefixed):
+        return prefixed
+
+    return direct
 
 
-def aggregate_prompt_prediction(
-    state: Dict[str, Any], prompt: str, conf_threshold: float
-) -> Optional[Dict[str, Any]]:
-    masks = state.get("masks")
-    scores = state.get("scores")
+def is_pseudo_color(img_bgr: np.ndarray) -> bool:
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    return float(np.mean(hsv[:, :, 1])) > PSEUDO_COLOR_SAT_THRESH
 
-    if masks is None or len(masks) == 0:
-        return None
 
-    if scores is None or len(scores) == 0:
-        scores_np = np.zeros(len(masks), dtype=np.float32)
+def estimate_noise_sigma(gray: np.ndarray) -> float:
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(np.median(np.abs(lap)) / 0.6745)
+
+
+def load_teacher_aligned_gray(image_path: str) -> np.ndarray:
+    img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"图片不存在或无法读取: {image_path}")
+    elif is_pseudo_color(img_bgr):
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     else:
-        scores_np = scores.detach().cpu().numpy().reshape(-1)
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    selected_indices = [
-        index for index, score in enumerate(scores_np) if float(score) >= conf_threshold
-    ]
-    if not selected_indices:
-        return None
+    fname = str(image_path).replace("\\", "/")
+    if "blackHot" in fname:
+        img = 255 - img
+    else:
+        mean = float(np.mean(img))
+        std = float(np.std(img))
+        if std > 0:
+            skew = float(np.mean(((img - mean) / std) ** 3))
+            if skew < BLACKHOT_SKEW_THRESH:
+                img = 255 - img
+        if mean > BLACKHOT_MEAN_THRESH and "vis" not in fname.lower():
+            img = 255 - img
 
-    merged_mask: Optional[np.ndarray] = None
-    for index in selected_indices:
-        mask_np = normalize_mask(masks[index])
-        if merged_mask is None:
-            merged_mask = mask_np
-        else:
-            merged_mask = np.logical_or(merged_mask, mask_np).astype(np.uint8)
+    std = float(np.std(img))
+    noise_sigma = estimate_noise_sigma(img)
+    blur_score = float(cv2.Laplacian(img, cv2.CV_64F).var())
 
-    if merged_mask is None:
-        return None
+    if std < STD_LOW:
+        img = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(img)
+    elif std < STD_MID:
+        img = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16)).apply(img)
 
-    return {
-        "prompt": prompt,
-        "score": float(np.max(scores_np[selected_indices])) if len(scores_np) > 0 else 0.0,
-        "instance_count": len(selected_indices),
-        "rle": mask_to_rle(merged_mask),
+    if noise_sigma > NOISE_HIGH:
+        img = cv2.bilateralFilter(img, d=5, sigmaColor=25, sigmaSpace=25)
+    elif noise_sigma > NOISE_MED:
+        img = cv2.medianBlur(img, 3)
+
+    if blur_score < BLUR_LOW:
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        img = np.clip(cv2.filter2D(img, -1, kernel), 0, 255).astype(np.uint8)
+    elif blur_score < BLUR_MID:
+        blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=1.0)
+        img = np.clip(cv2.addWeighted(img, 2.0, blurred, -1.0, 0), 0, 255).astype(np.uint8)
+
+    return img
+
+
+def preprocess_image(image_path: str, input_size: int) -> Tuple[torch.Tensor, Dict[str, int]]:
+    gray = load_teacher_aligned_gray(image_path)
+
+    orig_h, orig_w = gray.shape
+    scale = input_size / max(orig_h, orig_w)
+    resized_h = max(1, int(round(orig_h * scale)))
+    resized_w = max(1, int(round(orig_w * scale)))
+
+    gray = cv2.resize(gray, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+
+    pad_h = input_size - resized_h
+    pad_w = input_size - resized_w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    gray = cv2.copyMakeBorder(
+        gray,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+
+    rgb = np.stack([gray] * 3, axis=-1).astype(np.float32) / 255.0
+    mean = np.array(CLIP_MEAN, dtype=np.float32).reshape(1, 1, 3)
+    std = np.array(CLIP_STD, dtype=np.float32).reshape(1, 1, 3)
+    rgb = (rgb - mean) / std
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+
+    meta = {
+        "orig_h": orig_h,
+        "orig_w": orig_w,
+        "resized_h": resized_h,
+        "resized_w": resized_w,
+        "pad_top": pad_top,
+        "pad_left": pad_left,
     }
+    return tensor, meta
+
+
+def logits_to_mask(
+    logits: torch.Tensor,
+    meta: Dict[str, int],
+    threshold: float,
+    input_size: int,
+) -> Tuple[np.ndarray, float]:
+    if logits.ndim == 2:
+        logits = logits.unsqueeze(0).unsqueeze(0)
+    elif logits.ndim == 3:
+        logits = logits.unsqueeze(1)
+
+    logits = F.interpolate(logits, size=(input_size, input_size), mode="bilinear", align_corners=False)
+    prob = torch.sigmoid(logits[0, 0]).detach().cpu().numpy()
+
+    top = meta["pad_top"]
+    left = meta["pad_left"]
+    resized_h = meta["resized_h"]
+    resized_w = meta["resized_w"]
+    prob = prob[top:top + resized_h, left:left + resized_w]
+
+    prob = cv2.resize(prob, (meta["orig_w"], meta["orig_h"]), interpolation=cv2.INTER_LINEAR)
+    score = float(prob.max()) if prob.size > 0 else 0.0
+    mask = (prob >= threshold).astype(np.uint8)
+    return mask, score
+
+
+def get_mask_threshold(prompt: str, default_threshold: float) -> float:
+    return float(CLASS_MASK_THRESHOLDS.get(prompt, default_threshold))
 
 
 @torch.inference_mode()
 def do_inference(
     image_path: str,
     text_prompts: List[str],
+    model,
     processor,
-    conf_threshold: float,
+    model_input_size: int,
+    default_mask_threshold: float,
 ) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
-    image = Image.open(image_path).convert("RGB")
-    width, height = image.size
-
-    state = processor.set_image(image)
+    image_tensor, meta = preprocess_image(image_path, model_input_size)
     results_by_prompt: Dict[str, Dict[str, Any]] = {}
 
-    for prompt in text_prompts:
-        processor.reset_all_prompts(state)
-        state = processor.set_text_prompt(prompt=prompt, state=state)
-        prompt_prediction = aggregate_prompt_prediction(state, prompt, conf_threshold)
-        if prompt_prediction is not None:
-            results_by_prompt[prompt] = prompt_prediction
+    for start in range(0, len(text_prompts), PROMPT_BATCH_SIZE):
+        prompt_batch = text_prompts[start:start + PROMPT_BATCH_SIZE]
+        tokenized = processor.tokenizer(
+            prompt_batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
 
-    return results_by_prompt, width, height
+        pixel_values = image_tensor.unsqueeze(0).repeat(len(prompt_batch), 1, 1, 1).to(DEVICE)
+        input_ids = tokenized["input_ids"].to(DEVICE)
+        attention_mask = tokenized["attention_mask"].to(DEVICE)
+
+        logits = model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).logits
+
+        for prompt, prompt_logits in zip(prompt_batch, logits):
+            threshold = get_mask_threshold(prompt, default_mask_threshold)
+            mask, score = logits_to_mask(prompt_logits, meta, threshold, model_input_size)
+            if mask.sum() == 0:
+                continue
+            results_by_prompt[prompt] = {
+                "prompt": prompt,
+                "score": score,
+                "threshold": threshold,
+                "rle": mask_to_rle(mask),
+            }
+
+    return results_by_prompt, meta["orig_w"], meta["orig_h"]
 
 
 def load_tasks(tasks_path: str) -> List[Dict[str, Any]]:
-    with open(tasks_path, "r", encoding="utf-8") as file_obj:
+    # Accept both plain UTF-8 and UTF-8 with BOM from Windows-generated task files.
+    with open(tasks_path, "r", encoding="utf-8-sig") as file_obj:
         tasks = json.load(file_obj)
 
     if not isinstance(tasks, list):
@@ -191,15 +400,23 @@ def load_tasks(tasks_path: str) -> List[Dict[str, Any]]:
 def process_tasks(
     tasks: List[Dict[str, Any]],
     image_root: str,
+    model_dir: str,
     checkpoint_path: Optional[str],
     output_path: str,
-    conf_threshold: float,
+    mask_threshold: float,
 ) -> None:
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
-    model, processor = load_model(checkpoint_path)
+    model, processor, model_input_size = load_model(model_dir=model_dir, checkpoint_path=checkpoint_path)
     model_info = count_model_params(model)
+    model_info["model_type"] = "CLIPSegForImageSegmentation"
+    model_info["model_dir"] = model_dir
+    model_info["default_mask_threshold"] = float(mask_threshold)
+    model_info["model_input_size"] = int(model_input_size)
+    model_info["class_mask_thresholds"] = {
+        key: float(value) for key, value in sorted(CLASS_MASK_THRESHOLDS.items())
+    }
     if checkpoint_path:
         model_info["checkpoint_path"] = checkpoint_path
 
@@ -214,8 +431,15 @@ def process_tasks(
     inference_total_time = 0.0
     task_to_rle: Dict[Any, Dict[str, Any]] = {}
 
-    for image_rel_path, image_tasks in tasks_by_image.items():
-        image_abs_path = os.path.join(image_root, image_rel_path)
+    pbar = tqdm(
+        tasks_by_image.items(),
+        total=len(tasks_by_image),
+        desc="推理进度",
+        unit="img",
+    )
+
+    for image_rel_path, image_tasks in pbar:
+        image_abs_path = resolve_image_path(image_root, image_rel_path)
         print(f"\n处理图片: {image_rel_path}")
         print(f"  绝对路径: {image_abs_path}")
 
@@ -235,8 +459,10 @@ def process_tasks(
         results_by_prompt, width, height = do_inference(
             image_path=image_abs_path,
             text_prompts=unique_prompts,
+            model=model,
             processor=processor,
-            conf_threshold=conf_threshold,
+            model_input_size=model_input_size,
+            default_mask_threshold=mask_threshold,
         )
         empty_rle = build_empty_rle(height, width)
 
@@ -249,11 +475,12 @@ def process_tasks(
         elapsed = time.time() - image_start
         inference_total_time += elapsed
         processed_images += 1
-        hit_instances = sum(
-            result.get("instance_count", 0) for result in results_by_prompt.values()
+        pbar.set_postfix(
+            prompts=f"{len(results_by_prompt)}/{len(unique_prompts)}",
+            sec=f"{elapsed:.2f}",
         )
         print(
-            f"  完成: {len(results_by_prompt)}/{len(unique_prompts)} 个 prompt 命中, 合并 {hit_instances} 个实例, 耗时 {elapsed:.2f}s"
+            f"  完成: {len(results_by_prompt)}/{len(unique_prompts)} 个 prompt 命中, 耗时 {elapsed:.2f}s"
         )
 
     predictions_output = []
@@ -290,13 +517,15 @@ def process_tasks(
 
 def main() -> None:
     print("=" * 60)
-    print("SAM3 推理配置")
+    print("CLIPSeg 推理配置")
     print("=" * 60)
     print(f"任务文件: {DEFAULT_TASKS}")
     print(f"图片根目录: {DEFAULT_IMAGE_ROOT}")
     print(f"输出路径: {DEFAULT_OUTPUT_PATH}")
+    print(f"模型目录: {DEFAULT_MODEL_DIR}")
     print(f"模型检查点: {DEFAULT_CHECKPOINT_PATH}")
-    print(f"置信度阈值: {DEFAULT_CONF_THRESHOLD}")
+    print(f"默认掩码阈值: {DEFAULT_MASK_THRESHOLD}")
+    print(f"按类阈值: {CLASS_MASK_THRESHOLDS}")
     print(f"设备: {DEVICE}")
     print("=" * 60)
 
@@ -304,9 +533,10 @@ def main() -> None:
     process_tasks(
         tasks=tasks,
         image_root=DEFAULT_IMAGE_ROOT,
+        model_dir=DEFAULT_MODEL_DIR,
         checkpoint_path=DEFAULT_CHECKPOINT_PATH,
         output_path=DEFAULT_OUTPUT_PATH,
-        conf_threshold=DEFAULT_CONF_THRESHOLD,
+        mask_threshold=DEFAULT_MASK_THRESHOLD,
     )
 
 
