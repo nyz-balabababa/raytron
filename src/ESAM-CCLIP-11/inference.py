@@ -1218,8 +1218,8 @@ def resolve_checkpoint_thresholds(checkpoint: Dict[str, Any]) -> Dict[str, float
 
 def resolve_checkpoint_postprocess(checkpoint: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     raw_postprocess = (
-        checkpoint.get("postprocess")
-        or checkpoint.get("postprocess_cfg")
+        checkpoint.get("postprocess_cfg")
+        or checkpoint.get("postprocess")
         or DEFAULT_POSTPROCESS
     )
     normalized: Dict[str, Dict[str, Any]] = {}
@@ -1408,10 +1408,10 @@ def process_tasks(
 
     if postprocess_json is not None:
         LOGGER.info("使用 postprocess_json: %s", postprocess_json)
-    elif isinstance(checkpoint, dict) and "postprocess" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 postprocess")
     elif isinstance(checkpoint, dict) and "postprocess_cfg" in checkpoint:
         LOGGER.info("使用 checkpoint 内 postprocess_cfg")
+    elif isinstance(checkpoint, dict) and "postprocess" in checkpoint:
+        LOGGER.info("使用 checkpoint 内 postprocess")
     else:
         LOGGER.warning("checkpoint 内没有 postprocess_cfg，使用 DEFAULT_POSTPROCESS")
 
