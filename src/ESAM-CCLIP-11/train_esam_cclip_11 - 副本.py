@@ -170,11 +170,8 @@ def build_argparser():
     parser.add_argument("--no_auto_resume", action="store_true", default=False)
     parser.add_argument("--freeze_image_encoder", dest="freeze_image_encoder", action="store_true")
     parser.add_argument("--unfreeze_image_encoder", dest="freeze_image_encoder", action="store_false")
-    parser.add_argument("--unfreeze_image_mode", choices=["none", "last_norm", "last1", "last2"], default="none")
     parser.add_argument("--freeze_text_encoder", action="store_true", default=FREEZE_TEXT_ENCODER)
     parser.add_argument("--train_decoder_only", action="store_true", default=TRAIN_DECODER_ONLY)
-    parser.add_argument("--print_trainable_params", dest="print_trainable_params", action="store_true")
-    parser.add_argument("--no_print_trainable_params", dest="print_trainable_params", action="store_false")
     parser.add_argument("--use_prompt_prototype", dest="use_prompt_prototype", action="store_true")
     parser.add_argument("--no_prompt_prototype", dest="use_prompt_prototype", action="store_false")
     parser.add_argument("--text_cache_path", type=Path, default=TEXT_CACHE_PATH)
@@ -205,7 +202,6 @@ def build_argparser():
         freeze_image_encoder=FREEZE_IMAGE_ENCODER,
         use_prompt_prototype=USE_PROMPT_PROTOTYPE,
         rare_balance_enabled=False,
-        print_trainable_params=True,
     )
     return parser
 
@@ -245,17 +241,6 @@ def resolve_runtime_paths(args):
         args.resume = ensure_file(args.resume, "resume")
     if args.resume_best is not None:
         args.resume_best = ensure_file(args.resume_best, "resume_best")
-    return args
-
-
-def normalize_unfreeze_args(args):
-    if args.unfreeze_image_mode == "none":
-        args.freeze_image_encoder = True
-        args.image_lr = 0.0
-    else:
-        args.freeze_image_encoder = False
-        if args.image_lr <= 0:
-            args.image_lr = 1e-6
     return args
 
 
@@ -356,16 +341,6 @@ def build_optimizer(model, decoder_lr, image_lr, text_lr, weight_decay):
         param_groups.append({"params": other_params, "lr": decoder_lr, "weight_decay": weight_decay, "name": "other"})
     if not param_groups:
         raise RuntimeError("没有可训练参数，请检查冻结设置。")
-    LOGGER.info("[ParamGroupSummary] decoder_groups=%d image_groups=%d text_groups=%d other_groups=%d",
-                1 if decoder_params else 0,
-                1 if image_params and image_lr > 0 else 0,
-                1 if text_params and text_lr > 0 else 0,
-                1 if other_params else 0)
-    LOGGER.info("[ParamGroupSummary] decoder_params=%.2fM image_params=%.2fM text_params=%.2fM other_params=%.2fM",
-                sum(p.numel() for p in decoder_params) / 1e6,
-                sum(p.numel() for p in image_params) / 1e6,
-                sum(p.numel() for p in text_params) / 1e6,
-                sum(p.numel() for p in other_params) / 1e6)
     for group in param_groups:
         n_params = sum(p.numel() for p in group["params"]) / 1e6
         LOGGER.info("[ParamGroup] %s lr=%s params=%.2fM", group["name"], group["lr"], n_params)
@@ -373,127 +348,6 @@ def build_optimizer(model, decoder_lr, image_lr, text_lr, weight_decay):
         [{"params": g["params"], "lr": g["lr"], "weight_decay": g["weight_decay"]} for g in param_groups],
         weight_decay=weight_decay,
     )
-
-
-def _extract_last_block_prefixes(param_names, block_token: str):
-    block_indices = []
-    for name in param_names:
-        parts = name.split(".")
-        for idx, part in enumerate(parts[:-1]):
-            if part == block_token and idx + 1 < len(parts):
-                try:
-                    block_idx = int(parts[idx + 1])
-                except ValueError:
-                    continue
-                block_indices.append((block_idx, ".".join(parts[: idx + 2])))
-    unique = {}
-    for block_idx, prefix in block_indices:
-        unique[block_idx] = prefix
-    return [unique[idx] for idx in sorted(unique.keys())]
-
-
-def set_partial_image_encoder_trainable(model, mode: str):
-    for param in model.txt_encoder.parameters():
-        param.requires_grad = False
-    for param in model.img_encoder.parameters():
-        param.requires_grad = False
-    for param in model.decoder.parameters():
-        param.requires_grad = True
-
-    warnings = []
-    matched_names = []
-    if mode == "none":
-        return warnings, matched_names
-
-    named_params = list(model.img_encoder.named_parameters())
-    all_names = [name for name, _ in named_params]
-
-    def enable_by_predicate(predicate):
-        local_matched = []
-        for name, param in named_params:
-            if predicate(name):
-                param.requires_grad = True
-                local_matched.append(name)
-        return local_matched
-
-    if mode == "last_norm":
-        keywords = ("norm", "neck", "adapter", "output", "proj")
-        keyword_matches = [name for name in all_names if any(keyword in name.lower() for keyword in keywords)]
-        tail_names = set(keyword_matches[-32:]) if keyword_matches else set()
-        matched_names = enable_by_predicate(lambda name: name in tail_names)
-        if not matched_names:
-            warning = "unfreeze_image_mode=last_norm 未匹配到 image encoder 的 norm/neck/adapter/output/proj 参数。"
-            warnings.append(warning)
-            LOGGER.warning(warning)
-        return warnings, matched_names
-
-    prefixes = _extract_last_block_prefixes(all_names, "blocks")
-    if not prefixes:
-        prefixes = _extract_last_block_prefixes(all_names, "layers")
-
-    if not prefixes:
-        warning = f"unfreeze_image_mode={mode} 未识别到 image encoder blocks/layers，fallback 到 last_norm。"
-        warnings.append(warning)
-        LOGGER.warning(warning)
-        return set_partial_image_encoder_trainable(model, "last_norm")
-
-    n_blocks = 1 if mode == "last1" else 2
-    selected_prefixes = prefixes[-n_blocks:]
-    matched_names = enable_by_predicate(lambda name: any(name.startswith(prefix + ".") for prefix in selected_prefixes))
-    if not matched_names:
-        fallback_mode = "last1" if mode == "last2" else "last_norm"
-        warning = f"unfreeze_image_mode={mode} 未成功打开 block 参数，fallback 到 {fallback_mode}。"
-        warnings.append(warning)
-        LOGGER.warning(warning)
-        return set_partial_image_encoder_trainable(model, fallback_mode)
-    return warnings, matched_names
-
-
-def log_trainable_parameter_summary(model, args):
-    trainable_names = []
-    image_trainable_names = []
-    decoder_trainable_names = []
-    text_trainable_names = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        trainable_names.append(name)
-        if name.startswith("img_encoder"):
-            image_trainable_names.append(name)
-        elif name.startswith("decoder"):
-            decoder_trainable_names.append(name)
-        elif name.startswith("txt_encoder"):
-            text_trainable_names.append(name)
-
-    total_params, trainable_params = count_parameters(model)
-    image_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("img_encoder")) / 1e6
-    decoder_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("decoder")) / 1e6
-    text_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("txt_encoder")) / 1e6
-
-    LOGGER.info("unfreeze_image_mode=%s", args.unfreeze_image_mode)
-    LOGGER.info("image_lr=%s", args.image_lr)
-    LOGGER.info("trainable total params=%.2fM", trainable_params)
-    LOGGER.info("trainable decoder params=%.2fM", decoder_trainable_params)
-    LOGGER.info("trainable image_encoder params=%.2fM", image_trainable_params)
-    LOGGER.info("trainable text_encoder params=%.2fM", text_trainable_params)
-    preview = trainable_names[:50]
-    LOGGER.info("trainable parameter names preview(first %d): %s", len(preview), preview)
-
-    total_param_count = max(total_params * 1e6, 1.0)
-    image_ratio = (image_trainable_params * 1e6) / total_param_count
-    if args.unfreeze_image_mode != "none" and image_trainable_params <= 0:
-        raise RuntimeError("unfreeze_image_mode 已开启，但 image_encoder trainable params = 0，说明没有成功解冻。")
-    if args.unfreeze_image_mode == "last_norm" and image_trainable_params > 5.0:
-        LOGGER.warning(
-            "last_norm opened %.2fM image params (>5M)，这对档位A偏多，请检查匹配规则。",
-            image_trainable_params,
-        )
-    if image_ratio > 0.20:
-        LOGGER.warning("image_encoder trainable params ratio is high: %.2f%% (>20%%)", image_ratio * 100.0)
-    if args.unfreeze_image_mode != "none" and args.image_lr > args.decoder_lr:
-        LOGGER.warning("image_lr (%.2e) > decoder_lr (%.2e)，请确认这不是误设。", args.image_lr, args.decoder_lr)
-    if text_trainable_params > 0:
-        raise RuntimeError("text_encoder trainable params must stay 0.")
 
 
 def build_scheduler(optimizer, total_steps, warmup_steps, min_lr_ratio):
@@ -832,8 +686,6 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "esam_input_size": int(args.esam_input_size),
         "text_cache_path": str(args.text_cache_path),
         "run_name": args.run_name,
-        "unfreeze_image_mode": args.unfreeze_image_mode,
-        "image_lr": float(args.image_lr),
     }
     torch.save(payload, path)
 
@@ -900,7 +752,6 @@ def main():
     explicit_dests = collect_explicit_dests(parser, sys.argv[1:])
     args = apply_preset(parser.parse_args(), explicit_dests)
     args = resolve_runtime_paths(args)
-    args = normalize_unfreeze_args(args)
     args.output_dir = args.output_dir.resolve()
     run_dir = args.output_dir / args.run_name
     configure_logging(run_dir / f"{args.run_name}.log")
@@ -926,8 +777,6 @@ def main():
     LOGGER.info("freeze_image_encoder=%s", args.freeze_image_encoder)
     LOGGER.info("freeze_text_encoder=%s", args.freeze_text_encoder)
     LOGGER.info("train_decoder_only=%s", args.train_decoder_only)
-    LOGGER.info("unfreeze_image_mode=%s", args.unfreeze_image_mode)
-    LOGGER.info("print_trainable_params=%s", args.print_trainable_params)
     LOGGER.info("use_prompt_prototype=%s", args.use_prompt_prototype)
     LOGGER.info("use_image_cache=%s", args.use_image_cache)
     LOGGER.info("epochs=%s", args.epochs)
@@ -944,8 +793,6 @@ def main():
     LOGGER.info("class_weights=%s", args.class_weights)
     if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset"} and args.resume is None and args.resume_best is None:
         LOGGER.warning("preset=%s 建议显式传入 --resume_best 或 --resume 作为热启动起点。", args.preset)
-    if args.unfreeze_image_mode != "none" and not args.no_auto_resume:
-        LOGGER.warning("partial unfreeze 建议使用 --resume_best 和 --no_auto_resume，避免加载旧 optimizer 状态。")
     if args.no_val:
         LOGGER.info("当前使用全集训练直接提交模式，不使用验证集选择 best checkpoint，最终请使用 final_fullset.pt 或 last.pt。")
         if args.no_train_split_filter:
@@ -961,17 +808,16 @@ def main():
         freeze_text=args.freeze_text_encoder,
     ).to(device)
     if args.train_decoder_only:
-        partial_warnings, partial_matches = set_partial_image_encoder_trainable(model, args.unfreeze_image_mode)
-        if args.unfreeze_image_mode != "none":
-            LOGGER.info("partial image encoder trainable params matched=%d", len(partial_matches))
-            if partial_warnings:
-                LOGGER.info("partial image encoder warnings=%s", partial_warnings)
+        for param in model.img_encoder.parameters():
+            param.requires_grad = False
+        for param in model.txt_encoder.parameters():
+            param.requires_grad = False
+        for param in model.decoder.parameters():
+            param.requires_grad = True
 
     total_params, trainable_params = count_parameters(model)
     LOGGER.info("total parameter count=%.2fM", total_params)
     LOGGER.info("trainable parameter count=%.2fM", trainable_params)
-    if args.print_trainable_params:
-        log_trainable_parameter_summary(model, args)
 
     resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
     if resume_checkpoint_path is not None:

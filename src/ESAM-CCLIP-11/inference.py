@@ -54,16 +54,16 @@ DEFAULT_CLASSES = [
 
 DEFAULT_PROMPT_PROTOTYPES = {
     "person": ["person", "people", "pedestrian", "human", "人", "行人"],
-    "car": ["car", "vehicle", "automobile", "车辆", "汽车"],
+    "car": ["car", "vehicle", "automobile", "truck", "bus", "车辆", "汽车"],
     "building": ["building", "house", "architecture", "建筑", "楼"],
     "tree": ["tree", "vegetation", "树", "树木"],
     "animal": ["animal", "wild animal", "动物"],
-    "trash can": ["trash can", "garbage bin", "trashbin", "rubbish bin", "垃圾桶"],
+    "trash can": ["trash can", "trashcan", "garbage bin", "garbage can", "waste bin", "dustbin", "trashbin", "rubbish bin", "垃圾桶"],
     "window": ["window", "窗户"],
     "door": ["door", "entrance", "门"],
     "fence": ["fence", "railing", "栏杆", "围栏"],
-    "pole_light": ["pole_light", "pole light", "street light", "lamp", "light pole", "路灯", "灯杆"],
-    "motorcycle": ["motorcycle", "motorbike", "摩托车"],
+    "pole_light": ["pole_light", "pole light", "street light", "streetlight", "lamp", "lamp post", "light pole", "utility pole", "路灯", "灯杆"],
+    "motorcycle": ["motorcycle", "motorbike", "motor bike", "scooter", "摩托车"],
 }
 
 DEFAULT_THRESHOLDS = {
@@ -92,6 +92,31 @@ DEFAULT_POSTPROCESS = {
     "fence": {"min_area": 2, "fill_holes": False},
     "pole_light": {"min_area": 1, "fill_holes": False},
     "motorcycle": {"min_area": 4, "fill_holes": False},
+}
+
+RARE_FALLBACK_CLASSES = {
+    "trash can",
+    "window",
+    "door",
+    "fence",
+    "pole_light",
+    "motorcycle",
+}
+RARE_EMPTY_FALLBACK_DELTA = 0.05
+RARE_EMPTY_FALLBACK_CFG = {
+    "trash can": {"min_area": 2, "topk_components": 1},
+    "window": {"min_area": 2, "topk_components": 2},
+    "door": {"min_area": 4, "topk_components": 1},
+    "fence": {"min_area": 1, "topk_components": 3},
+    "pole_light": {"min_area": 1, "topk_components": 2},
+    "motorcycle": {"min_area": 2, "topk_components": 1},
+}
+LARGE_AREA_DEBUG_THRESHOLDS = {
+    "person": 0.35,
+    "car": 0.40,
+    "building": 0.85,
+    "tree": 0.70,
+    "animal": 0.20,
 }
 
 PSEUDO_COLOR_SAT_THRESH = 60.0
@@ -369,11 +394,16 @@ def count_model_params(model: torch.nn.Module, device: torch.device) -> Dict[str
     }
 
 
+def normalize_prompt_key(text: str) -> str:
+    normalized = str(text).strip().lower().replace("_", " ").replace("-", " ")
+    return " ".join(normalized.split())
+
+
 def build_prompt_aliases(prompt_prototypes: Dict[str, List[str]], classes: List[str]) -> Dict[str, str]:
     aliases: Dict[str, str] = {}
     for class_name in classes:
         for alias in prompt_prototypes.get(class_name, [class_name]) + [class_name]:
-            aliases[str(alias).strip().lower()] = class_name
+            aliases[normalize_prompt_key(alias)] = class_name
     return aliases
 
 
@@ -549,10 +579,9 @@ def preprocess_image(image_path: str, input_size: int) -> Tuple[torch.Tensor, Di
     return torch.from_numpy(rgb).float(), meta
 
 
-def logits_to_mask(
+def logits_to_probability_map(
     logits: torch.Tensor,
     meta: Dict[str, int],
-    threshold: float,
     input_size: int,
 ) -> Tuple[np.ndarray, float]:
     if logits.ndim == 2:
@@ -577,6 +606,16 @@ def logits_to_mask(
     prob = cv2.resize(prob, (meta["orig_w"], meta["orig_h"]), interpolation=cv2.INTER_LINEAR)
 
     score = float(prob.max()) if prob.size > 0 else 0.0
+    return prob, score
+
+
+def logits_to_mask(
+    logits: torch.Tensor,
+    meta: Dict[str, int],
+    threshold: float,
+    input_size: int,
+) -> Tuple[np.ndarray, float]:
+    prob, score = logits_to_probability_map(logits, meta, input_size)
     return (prob >= threshold).astype(np.uint8), score
 
 
@@ -602,8 +641,36 @@ def fill_small_holes(mask: np.ndarray) -> np.ndarray:
     return canvas.astype(np.uint8)
 
 
-def apply_postprocess(mask: np.ndarray, min_area: int = 0, fill_holes: bool = False) -> np.ndarray:
+def keep_top_k_components(mask: np.ndarray, topk_components: Optional[int]) -> np.ndarray:
+    if topk_components is None or int(topk_components) <= 0:
+        return (mask > 0).astype(np.uint8)
+    binary = (mask > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 1:
+        return binary
+    components: List[Tuple[int, int]] = []
+    for label_idx in range(1, num_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area > 0:
+            components.append((area, label_idx))
+    if not components:
+        return np.zeros_like(binary)
+    components.sort(reverse=True)
+    keep_labels = {label_idx for _, label_idx in components[: int(topk_components)]}
+    filtered = np.zeros_like(binary)
+    for label_idx in keep_labels:
+        filtered[labels == label_idx] = 1
+    return filtered
+
+
+def apply_postprocess(
+    mask: np.ndarray,
+    min_area: int = 0,
+    fill_holes: bool = False,
+    topk_components: Optional[int] = None,
+) -> np.ndarray:
     processed = remove_small_components(mask, min_area=min_area)
+    processed = keep_top_k_components(processed, topk_components=topk_components)
     if fill_holes:
         processed = fill_small_holes(processed)
     return processed.astype(np.uint8)
@@ -992,7 +1059,7 @@ def load_checkpoint_flexible(
 
 
 def map_prompt_to_known_class(prompt_text: str, prompt_aliases: Dict[str, str]) -> Optional[str]:
-    return prompt_aliases.get(str(prompt_text).strip().lower())
+    return prompt_aliases.get(normalize_prompt_key(prompt_text))
 
 
 def build_text_feature_for_prompt(
@@ -1056,6 +1123,30 @@ def get_prompt_postprocess(
 ) -> Dict[str, Any]:
     key = mapped_class if mapped_class is not None else prompt_text
     return postprocess_cfg.get(key, {"min_area": 0, "fill_holes": False})
+
+
+def apply_rare_empty_fallback(
+    prob: np.ndarray,
+    class_name: Optional[str],
+    threshold: float,
+    base_post_cfg: Dict[str, Any],
+) -> Optional[np.ndarray]:
+    if class_name not in RARE_FALLBACK_CLASSES:
+        return None
+    fallback_cfg = RARE_EMPTY_FALLBACK_CFG.get(class_name or "")
+    if fallback_cfg is None:
+        return None
+    fallback_threshold = max(0.0, float(threshold) - RARE_EMPTY_FALLBACK_DELTA)
+    fallback_mask = (prob >= fallback_threshold).astype(np.uint8)
+    fallback_mask = apply_postprocess(
+        fallback_mask,
+        min_area=int(fallback_cfg.get("min_area", 0)),
+        fill_holes=bool(base_post_cfg.get("fill_holes", False)),
+        topk_components=int(fallback_cfg.get("topk_components", 0)),
+    )
+    if int(fallback_mask.sum()) <= 0:
+        return None
+    return fallback_mask
 
 
 def choose_tokenizer_dir(model_dir: Path, tokenizer_path: Optional[str]) -> str:
@@ -1133,10 +1224,13 @@ def resolve_checkpoint_postprocess(checkpoint: Dict[str, Any]) -> Dict[str, Dict
     )
     normalized: Dict[str, Dict[str, Any]] = {}
     for key, cfg in raw_postprocess.items():
-        normalized[str(key)] = {
+        normalized_cfg = {
             "min_area": int(cfg.get("min_area", 0)),
             "fill_holes": bool(cfg.get("fill_holes", False)),
         }
+        if "topk_components" in cfg and cfg.get("topk_components") is not None:
+            normalized_cfg["topk_components"] = int(cfg.get("topk_components", 0))
+        normalized[str(key)] = normalized_cfg
     return normalized
 
 
@@ -1203,12 +1297,17 @@ def do_inference(
     postprocess_cfg: Dict[str, Dict[str, Any]],
     prompt_aliases: Dict[str, str],
     default_mask_threshold: float,
+    rare_empty_fallback: bool = False,
     prompt_feature_cache: Optional[Dict[str, Tuple[torch.Tensor, Optional[str]]]] = None,
-) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+) -> Tuple[Dict[str, Dict[str, Any]], int, int, Dict[str, Any]]:
     device = next(model.parameters()).device
     image_tensor, meta = preprocess_image(image_path, model_input_size)
     image_embedding = model.encode_image(image_tensor.unsqueeze(0).to(device, non_blocking=True))
     results_by_prompt: Dict[str, Dict[str, Any]] = {}
+    debug_stats: Dict[str, Any] = {
+        "fallback_hit_count": 0,
+        "fallback_by_class": defaultdict(int),
+    }
 
     for start in range(0, len(text_prompts), PROMPT_BATCH_SIZE):
         prompt_batch = text_prompts[start:start + PROMPT_BATCH_SIZE]
@@ -1243,12 +1342,20 @@ def do_inference(
         for prompt_text, mapped_class, prompt_logits in zip(prompt_batch, mapped_classes, logits):
             threshold = get_prompt_threshold(prompt_text, mapped_class, thresholds, default_mask_threshold)
             post_cfg = get_prompt_postprocess(prompt_text, mapped_class, postprocess_cfg)
-            mask, score = logits_to_mask(prompt_logits, meta, threshold, model_input_size)
+            prob, score = logits_to_probability_map(prompt_logits, meta, model_input_size)
+            mask = (prob >= threshold).astype(np.uint8)
             mask = apply_postprocess(
                 mask,
                 min_area=int(post_cfg.get("min_area", 0)),
                 fill_holes=bool(post_cfg.get("fill_holes", False)),
+                topk_components=post_cfg.get("topk_components"),
             )
+            if mask.sum() == 0 and rare_empty_fallback:
+                fallback_mask = apply_rare_empty_fallback(prob, mapped_class, threshold, post_cfg)
+                if fallback_mask is not None and int(fallback_mask.sum()) > 0:
+                    mask = fallback_mask
+                    debug_stats["fallback_hit_count"] += 1
+                    debug_stats["fallback_by_class"][mapped_class or prompt_text] += 1
             if mask.sum() == 0:
                 continue
             results_by_prompt[prompt_text] = {
@@ -1256,10 +1363,11 @@ def do_inference(
                 "mapped_class": mapped_class,
                 "score": float(score),
                 "threshold": float(threshold),
+                "mask_area": int(mask.sum()),
                 "rle": encode_mask_to_rle(mask),
             }
 
-    return results_by_prompt, int(meta["orig_w"]), int(meta["orig_h"])
+    return results_by_prompt, int(meta["orig_w"]), int(meta["orig_h"]), debug_stats
 
 
 def process_tasks(
@@ -1275,6 +1383,7 @@ def process_tasks(
     postprocess_json: Optional[str] = None,
     fail_safe: bool = True,
     save_debug_json: bool = False,
+    rare_empty_fallback: bool = False,
 ) -> None:
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -1337,6 +1446,10 @@ def process_tasks(
     empty_mask_count = 0
     class_pred_count: Dict[str, int] = defaultdict(int)
     class_empty_count: Dict[str, int] = defaultdict(int)
+    pred_area_ratio_values: Dict[str, List[float]] = defaultdict(list)
+    large_area_count_by_class: Dict[str, int] = defaultdict(int)
+    fallback_hit_count = 0
+    fallback_by_class: Dict[str, int] = defaultdict(int)
 
     for image_rel_path, image_tasks in maybe_tqdm(
         tasks_by_image.items(),
@@ -1348,7 +1461,7 @@ def process_tasks(
         image_start = time.time()
         try:
             unique_prompts = list(dict.fromkeys(get_prompt_text(task) for task in image_tasks))
-            results_by_prompt, width, height = do_inference(
+            results_by_prompt, width, height, image_debug_stats = do_inference(
                 image_path=image_abs_path,
                 text_prompts=unique_prompts,
                 model=model,
@@ -1359,9 +1472,14 @@ def process_tasks(
                 postprocess_cfg=postprocess_cfg,
                 prompt_aliases=prompt_aliases,
                 default_mask_threshold=mask_threshold,
+                rare_empty_fallback=rare_empty_fallback,
                 prompt_feature_cache=prompt_feature_cache,
             )
+            fallback_hit_count += int(image_debug_stats.get("fallback_hit_count", 0))
+            for class_name, hit_count in image_debug_stats.get("fallback_by_class", {}).items():
+                fallback_by_class[str(class_name)] += int(hit_count)
             empty_rle = empty_mask_rle(height, width)
+            image_area = max(int(width) * int(height), 1)
             for task in image_tasks:
                 ann_id = task["ann_id"]
                 prompt_text = get_prompt_text(task)
@@ -1375,6 +1493,11 @@ def process_tasks(
                     task_to_rle[ann_id] = prediction["rle"]
                     pred_class_key = prediction.get("mapped_class") or prompt_class_key
                     class_pred_count[pred_class_key] += 1
+                    mask_area = int(prediction.get("mask_area", 0))
+                    area_ratio = float(mask_area / image_area)
+                    pred_area_ratio_values[pred_class_key].append(area_ratio)
+                    if area_ratio >= float(LARGE_AREA_DEBUG_THRESHOLDS.get(pred_class_key, 1.01)):
+                        large_area_count_by_class[pred_class_key] += 1
         except Exception as exc:
             if not fail_safe:
                 raise
@@ -1422,6 +1545,20 @@ def process_tasks(
         "class_prediction_stats": {
             "pred_count": {key: int(value) for key, value in sorted(class_pred_count.items())},
             "empty_count": {key: int(value) for key, value in sorted(class_empty_count.items())},
+            "pred_area_ratio_by_class": {
+                key: float(sum(values) / max(len(values), 1))
+                for key, values in sorted(pred_area_ratio_values.items())
+            },
+            "large_area_count_by_class": {
+                key: int(value) for key, value in sorted(large_area_count_by_class.items())
+            },
+        },
+        "rare_fallback_stats": {
+            "rare_empty_fallback_enabled": bool(rare_empty_fallback),
+            "fallback_hit_count": int(fallback_hit_count),
+            "fallback_by_class": {
+                key: int(value) for key, value in sorted(fallback_by_class.items())
+            },
         },
     }
     if failed_items:
@@ -1442,6 +1579,8 @@ def process_tasks(
     LOGGER.info("处理 task 数: %d", len(tasks))
     LOGGER.info("empty_mask_count: %d", empty_mask_count)
     LOGGER.info("failed_count: %d", len(failed_items))
+    LOGGER.info("rare_empty_fallback_enabled: %s", rare_empty_fallback)
+    LOGGER.info("fallback_hit_count: %d", fallback_hit_count)
 
 
 def main() -> None:
@@ -1463,6 +1602,7 @@ def main() -> None:
     parser.add_argument("--mask_threshold", type=float, default=DEFAULT_MASK_THRESHOLD)
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--save_debug_json", action="store_true")
+    parser.add_argument("--rare_empty_fallback", action="store_true")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -1475,6 +1615,7 @@ def main() -> None:
     print(f"模型检查点: {args.checkpoint}")
     print(f"默认输入尺寸: {DEFAULT_SUBMIT_IMG_SIZE} (若 checkpoint 含 img_size 则优先使用)")
     print(f"设备: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"rare empty fallback: {args.rare_empty_fallback}")
     print("=" * 60)
 
     tasks = load_tasks(resolve_path(args.tasks) or args.tasks)
@@ -1491,6 +1632,7 @@ def main() -> None:
         postprocess_json=resolve_path(args.postprocess_json) if args.postprocess_json else None,
         fail_safe=not args.strict,
         save_debug_json=args.save_debug_json,
+        rare_empty_fallback=args.rare_empty_fallback,
     )
 
 

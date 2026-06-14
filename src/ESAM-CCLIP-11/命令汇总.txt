@@ -1,0 +1,190 @@
+ESAM-CCLIP-11 命令汇总
+
+说明
+- 以下命令默认在项目根目录 D:\nyz\raytron_project 下执行。
+- 以下均为 PowerShell 多行写法，续行符使用反引号 ` 。
+- 带 <...> 的路径需要你按实际权重替换。
+
+
+一、训练命令
+
+1. 路线一：lite_fullset_polish
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset lite_fullset_polish `
+  --resume_best <你的热启动权重.pt> `
+  --no_val `
+  --no_train_split_filter `
+  --no_auto_resume `
+  --epochs 3 `
+  --decoder_lr 5e-5 `
+  --rebuild_text_cache `
+  --text_cache_path test/cache/text_emb_11_lite_polish.pt
+
+
+2. 路线二 Stage1：split_bridge_stage1
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset split_bridge_stage1 `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-control/best_all11.pt `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 3 `
+  --decoder_lr 5e-5 `
+  --rebuild_text_cache `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt
+
+
+3. 路线二 Stage2：split_bridge_stage2_fullset
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset split_bridge_stage2_fullset `
+  --resume_best <Stage1 产出的 best_all11.pt> `
+  --no_val `
+  --no_train_split_filter `
+  --no_auto_resume `
+  --epochs 3 `
+  --decoder_lr 3e-5 `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt
+
+
+4. 局部解冻：partial_unfreeze_lastnorm
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset partial_unfreeze_lastnorm `
+  --resume_best <你的热启动权重.pt> `
+  --no_auto_resume
+
+
+5. 局部解冻：partial_unfreeze_last1
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset partial_unfreeze_last1 `
+  --resume_best <你的热启动权重.pt> `
+  --no_auto_resume
+
+
+6. 手动指定 partial unfreeze
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset split_bridge_stage1 `
+  --resume_best <你的热启动权重.pt> `
+  --unfreeze_image_mode last_norm `
+  --image_lr 1e-6 `
+  --decoder_lr 2e-5 `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume
+
+
+二、Sweep 命令
+
+1. lite_fullset_polish：fine_recall
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-lite-fullset-polish/final_fullset.pt `
+  --text_cache_path test/cache/text_emb_11_lite_polish.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_lite_fullset_polish_fine_recall `
+  --write_back_path model/submit-lite-fullset-polish-fine-recall/sam3.pt
+
+
+2. lite_fullset_polish：safe
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-lite-fullset-polish/final_fullset.pt `
+  --text_cache_path test/cache/text_emb_11_lite_polish.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --sweep_mode safe `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_lite_fullset_polish_safe `
+  --write_back_path model/submit-lite-fullset-polish-safe/sam3.pt
+
+
+3. split-control best_all11：fine_recall
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-split-control/best_all11.pt `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_split_control_fine_recall `
+  --write_back_path model/submit-split-control-fine-recall/sam3.pt
+
+
+4. 路线二 Stage2 fullset：fine_recall
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint <Stage2 产出的 final_fullset.pt> `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_split_bridge_stage2_fine_recall `
+  --write_back_path model/submit-split-bridge-stage2-fine-recall/sam3.pt
+
+
+5. 只想全量验证集 sweep
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint <你的权重.pt> `
+  --text_cache_path <对应 text cache>.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 0 `
+  --output_dir <你的输出目录> `
+  --write_back_path <你的 sam3.pt 输出路径>
+
+
+三、辅助命令
+
+1. 查看 train 参数帮助
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py --help
+
+
+2. 查看 sweep 参数帮助
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py --help
+
+
+3. checkpoint averaging
+
+python src/ESAM-CCLIP-11/tools/average_checkpoints.py `
+  --checkpoints <ckpt1.pt> <ckpt2.pt> <ckpt3.pt> `
+  --output <averaged.pt>
+
+
+4. checkpoint averaging 查看帮助
+
+python src/ESAM-CCLIP-11/tools/average_checkpoints.py --help
+
+
+四、常看输出文件
+
+- 训练日志：
+  test/train_output/<run_name>/<run_name>.log
+
+- 训练权重：
+  best_all11.pt
+  best_old5.pt
+  best_rare.pt
+  final_fullset.pt
+  final_split.pt
+  last.pt
+
+- sweep 输出：
+  best_thresholds.json
+  best_postprocess.json
+  sweep_summary.json
+  sweep_summary_terminal.txt
+  threshold_sweep_summary.csv

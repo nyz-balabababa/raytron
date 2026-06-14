@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,7 @@ for candidate in [str(ESAM_ROOT), str(PROJECT_ROOT)]:
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
+import cv2
 import numpy as np
 import torch
 
@@ -37,7 +39,6 @@ from config_esam_cclip_11 import (
 )
 from common_esam_cclip_11 import (
     ESAMCCLIPModel,
-    apply_postprocess,
     compute_metrics,
     load_tokenizer,
     maybe_tqdm,
@@ -72,6 +73,7 @@ DEFAULT_DEVICE = DEVICE
 DEFAULT_WRITE_BACK_CHECKPOINT = True
 DEFAULT_REBUILD_TEXT_CACHE = True if REBUILD_TEXT_CACHE is False else REBUILD_TEXT_CACHE
 DEFAULT_MAX_SAMPLES_PER_CLASS = 500
+DEFAULT_SWEEP_CACHE_DIR = ROOT / "test" / "cache" / "sweep_thresholds_11"
 
 SAFE_THRESH_GRID = {
     "person": [0.60, 0.65, 0.70],
@@ -101,7 +103,21 @@ RECALL_THRESH_GRID = {
     "motorcycle": [0.25, 0.30, 0.35, 0.40],
 }
 
-MIN_AREA_GRID = {
+FINE_RECALL_THRESH_GRID = {
+    "person": [0.53, 0.55, 0.57, 0.60, 0.62, 0.65],
+    "car": [0.53, 0.55, 0.57, 0.60, 0.62, 0.65],
+    "building": [0.58, 0.60, 0.62, 0.65, 0.67, 0.70],
+    "tree": [0.43, 0.45, 0.47, 0.50, 0.52, 0.55],
+    "animal": [0.38, 0.40, 0.42, 0.45, 0.47, 0.50],
+    "trash can": [0.23, 0.25, 0.27, 0.30, 0.32, 0.35],
+    "window": [0.23, 0.25, 0.27, 0.30, 0.32, 0.35],
+    "door": [0.23, 0.25, 0.27, 0.30, 0.32, 0.35],
+    "fence": [0.13, 0.15, 0.17, 0.20, 0.22, 0.25],
+    "pole_light": [0.08, 0.10, 0.12, 0.15, 0.17, 0.20],
+    "motorcycle": [0.23, 0.25, 0.27, 0.30, 0.32, 0.35],
+}
+
+DEFAULT_MIN_AREA_GRID = {
     "person": [16, 32, 64],
     "car": [16, 32, 64],
     "building": [64, 128, 256],
@@ -115,22 +131,57 @@ MIN_AREA_GRID = {
     "motorcycle": [2, 4, 8, 16],
 }
 
+FINE_RECALL_MIN_AREA_GRID = {
+    "person": [8, 16, 32],
+    "car": [8, 16, 32],
+    "building": [64, 128, 256],
+    "tree": [32, 64, 128],
+    "animal": [4, 8, 16],
+    "trash can": [1, 2, 4, 8],
+    "window": [1, 2, 4, 8],
+    "door": [2, 4, 8, 16],
+    "fence": [1, 2, 4],
+    "pole_light": [1, 2, 4],
+    "motorcycle": [2, 4, 8],
+}
+
+TOPK_COMPONENTS_GRID = {
+    "window": [None, 2, 3],
+    "fence": [None, 3, 5],
+    "pole_light": [None, 2, 3],
+    "trash can": [None, 1],
+    "door": [None, 1],
+    "motorcycle": [None, 1],
+}
+
 
 def resolve_threshold_grid(sweep_mode: str) -> dict:
     if sweep_mode == "safe":
         return SAFE_THRESH_GRID
     if sweep_mode == "recall":
         return RECALL_THRESH_GRID
+    if sweep_mode == "fine_recall":
+        return FINE_RECALL_THRESH_GRID
     raise ValueError(f"unsupported sweep_mode: {sweep_mode}")
 
 
+def resolve_min_area_grid(sweep_mode: str) -> dict:
+    if sweep_mode == "fine_recall":
+        return FINE_RECALL_MIN_AREA_GRID
+    return DEFAULT_MIN_AREA_GRID
+
+
 def resolve_default_output_dir(sweep_mode: str) -> Path:
+    if sweep_mode == "fine_recall":
+        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_fine_recall"
     if sweep_mode == "recall":
         return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_recall"
     return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_safe"
 
 
 def resolve_default_write_back_path(sweep_mode: str) -> Path:
+    if sweep_mode == "fine_recall":
+        return ROOT / "model" / "submit-rsam-fine-recall" / "sam3.pt"
     if sweep_mode == "recall":
         return ROOT / "model" / "submit-rsam-recall" / "sam3.pt"
     return ROOT / "model" / "submit-rsam-safe" / "sam3.pt"
@@ -164,6 +215,13 @@ def configure_logging():
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s"))
     LOGGER.addHandler(handler)
+
+
+def attach_file_logging(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s"))
+    LOGGER.addHandler(file_handler)
 
 
 def collate_fn(batch):
@@ -207,8 +265,8 @@ def collect_validation_logits(model, dataset, text_cache_payload, device, max_sa
         for idx, class_name in enumerate(batch["class_names"]):
             seen_counts[class_name] += 1
             sample = {
-                "logit": logits[idx, 0].detach().cpu().numpy(),
-                "mask": batch["masks"][idx, 0].detach().cpu().numpy(),
+                "logit": logits[idx, 0].detach().cpu().numpy().astype(np.float16),
+                "mask": (batch["masks"][idx, 0].detach().cpu().numpy() > 0.5).astype(np.uint8),
             }
             if max_samples_per_class is None or max_samples_per_class <= 0:
                 records[class_name].append(sample)
@@ -222,58 +280,171 @@ def collect_validation_logits(model, dataset, text_cache_payload, device, max_sa
     return records, seen_counts
 
 
-def default_cfg_for_class(class_name: str, threshold_grid: dict) -> dict:
+def default_cfg_for_class(class_name: str, threshold_grid: dict, min_area_grid: dict) -> dict:
     return {
         "threshold": float(threshold_grid[class_name][0]),
-        "min_area": int(MIN_AREA_GRID[class_name][0]),
+        "min_area": int(min_area_grid[class_name][0]),
         "fill_holes": bool(POSTPROCESS_DEFAULT[class_name]["fill_holes"]),
+        "topk_components": None,
     }
 
 
-def log_sweep_summary(
+def resolve_topk_grid(class_name: str):
+    return TOPK_COMPONENTS_GRID.get(class_name, [None])
+
+
+def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 0:
+        return mask.astype(np.uint8)
+    binary = (mask > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    filtered = np.zeros_like(binary)
+    for label_idx in range(1, num_labels):
+        if stats[label_idx, cv2.CC_STAT_AREA] >= int(min_area):
+            filtered[labels == label_idx] = 1
+    return filtered
+
+
+def fill_small_holes(mask: np.ndarray) -> np.ndarray:
+    binary = (mask > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return binary
+    canvas = binary.copy()
+    cv2.drawContours(canvas, contours, -1, 1, thickness=cv2.FILLED)
+    return canvas.astype(np.uint8)
+
+
+def keep_top_k_components(mask: np.ndarray, topk_components: Optional[int]) -> np.ndarray:
+    if topk_components is None or int(topk_components) <= 0:
+        return (mask > 0).astype(np.uint8)
+    binary = (mask > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 1:
+        return binary
+    components = []
+    for label_idx in range(1, num_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area > 0:
+            components.append((area, label_idx))
+    if not components:
+        return np.zeros_like(binary)
+    components.sort(reverse=True)
+    keep_labels = {label_idx for _, label_idx in components[: int(topk_components)]}
+    filtered = np.zeros_like(binary)
+    for label_idx in keep_labels:
+        filtered[labels == label_idx] = 1
+    return filtered
+
+
+def apply_postprocess_with_topk(
+    mask: np.ndarray,
+    min_area: int = 0,
+    fill_holes: bool = False,
+    topk_components: Optional[int] = None,
+) -> np.ndarray:
+    processed = remove_small_components(mask, min_area=min_area)
+    processed = keep_top_k_components(processed, topk_components=topk_components)
+    if fill_holes:
+        processed = fill_small_holes(processed)
+    return processed.astype(np.uint8)
+
+
+def build_sweep_summary_lines(
     sweep_mode: str,
     checkpoint_path: Path,
+    max_samples_per_class: Optional[int],
+    sample_counts: dict,
     best_metric: float,
     best_thresholds: dict,
     best_postprocess: dict,
+    best_scores: dict,
+    best_metrics: dict,
     write_back_path: Optional[Path],
     threshold_grid: dict,
+    min_area_grid: dict,
 ):
-    LOGGER.info("========== Sweep Summary ==========")
-    LOGGER.info("sweep_mode: %s", sweep_mode)
-    LOGGER.info("checkpoint: %s", checkpoint_path)
-    LOGGER.info("best_metric: %.6f", best_metric)
-    LOGGER.info("best_thresholds:")
+    lines = [
+        "========== Sweep Summary ==========",
+        f"sweep_mode: {sweep_mode}",
+        f"checkpoint: {checkpoint_path}",
+        f"max_samples_per_class: {max_samples_per_class}",
+        f"best_metric: {best_metric:.6f}",
+        "sample_counts:",
+    ]
     for class_name in CLASSES:
-        LOGGER.info("  %s: %.2f", class_name, float(best_thresholds[class_name]))
-    LOGGER.info("best_postprocess:")
+        lines.append(f"  {class_name}: {int(sample_counts.get(class_name, 0))}")
+    lines.append("best_per_class:")
     for class_name in CLASSES:
         post_cfg = best_postprocess[class_name]
-        LOGGER.info(
-            "  %s: min_area=%s, fill_holes=%s",
-            class_name,
-            post_cfg["min_area"],
-            post_cfg["fill_holes"],
+        metric_cfg = best_metrics[class_name]
+        lines.append(
+            f"  {class_name}: threshold={float(best_thresholds[class_name]):.2f}, "
+            f"min_area={post_cfg['min_area']}, topk_components={post_cfg.get('topk_components')}, "
+            f"score={float(best_scores[class_name]):.4f}, "
+            f"fill_holes={post_cfg['fill_holes']}, iou={float(metric_cfg['iou']):.4f}, "
+            f"precision={float(metric_cfg['precision']):.4f}, recall={float(metric_cfg['recall']):.4f}, "
+            f"pred_area={float(metric_cfg['pred_area']):.2f}, gt_area={float(metric_cfg['gt_area']):.2f}"
         )
-    LOGGER.info("write_back_path: %s", write_back_path if write_back_path is not None else "disabled")
+    lines.append(f"write_back_path: {write_back_path if write_back_path is not None else 'disabled'}")
 
     if best_thresholds["pole_light"] == min(threshold_grid["pole_light"]) or best_thresholds["fence"] == min(threshold_grid["fence"]):
-        LOGGER.info("如果 pole_light/fence 阈值被选到最低，说明 rare recall 仍偏弱；")
+        lines.append("如果 pole_light/fence 阈值被选到最低，说明 rare recall 仍偏弱；")
     if any(
         best_thresholds[class_name] == min(threshold_grid[class_name])
         for class_name in ("person", "car", "building", "tree", "animal")
     ):
-        LOGGER.info("如果 old 类阈值被选到最低，说明模型偏保守；")
+        lines.append("如果 old 类阈值被选到最低，说明模型偏保守；")
     if any(
-        best_postprocess[class_name]["min_area"] == max(MIN_AREA_GRID[class_name])
+        best_postprocess[class_name]["min_area"] == max(min_area_grid[class_name])
         for class_name in CLASSES
     ):
-        LOGGER.info("如果某类 min_area 被选到最大，说明该类噪声偏多；")
+        lines.append("如果某类 min_area 被选到最大，说明该类噪声偏多；")
     if any(
-        best_postprocess[class_name]["min_area"] == min(MIN_AREA_GRID[class_name])
+        best_postprocess[class_name]["min_area"] == min(min_area_grid[class_name])
         for class_name in CLASSES
     ):
-        LOGGER.info("如果某类 min_area 被选到最小，说明小目标保留有收益。")
+        lines.append("如果某类 min_area 被选到最小，说明小目标保留有收益。")
+    return lines
+
+
+def log_sweep_summary(summary_lines):
+    for line in summary_lines:
+        LOGGER.info(line)
+
+
+def persist_sweep_summary_cache(
+    output_dir: Path,
+    cache_dir: Path,
+    checkpoint_path: Path,
+    sweep_mode: str,
+    summary_lines,
+    summary_payload: dict,
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_stem = Path(checkpoint_path).stem
+    output_summary_path = output_dir / "sweep_summary_terminal.txt"
+    output_summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    cache_text_latest = cache_dir / f"{checkpoint_stem}_{sweep_mode}_latest.txt"
+    cache_json_latest = cache_dir / f"{checkpoint_stem}_{sweep_mode}_latest.json"
+    cache_text_history = cache_dir / f"{checkpoint_stem}_{sweep_mode}_{timestamp}.txt"
+    cache_json_history = cache_dir / f"{checkpoint_stem}_{sweep_mode}_{timestamp}.json"
+
+    for path in [cache_text_latest, cache_text_history]:
+        path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    for path in [cache_json_latest, cache_json_history]:
+        save_json(path, summary_payload)
+
+    return {
+        "output_summary_path": str(output_summary_path),
+        "cache_text_latest": str(cache_text_latest),
+        "cache_json_latest": str(cache_json_latest),
+        "cache_text_history": str(cache_text_history),
+        "cache_json_history": str(cache_json_history),
+    }
 
 
 def main():
@@ -290,7 +461,7 @@ def main():
     parser.add_argument("--text_cache_path", type=Path, default=DEFAULT_TEXT_CACHE_PATH)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE if DEFAULT_DEVICE else ("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--sweep_mode", choices=["safe", "recall"], default=DEFAULT_SWEEP_MODE)
+    parser.add_argument("--sweep_mode", choices=["safe", "recall", "fine_recall"], default=DEFAULT_SWEEP_MODE)
     parser.add_argument("--write_back_checkpoint", dest="write_back_checkpoint", action="store_true")
     parser.add_argument("--no_write_back_checkpoint", dest="write_back_checkpoint", action="store_false")
     parser.add_argument("--write_back_path", type=Path, default=None)
@@ -307,7 +478,11 @@ def main():
     if args.write_back_checkpoint:
         args.write_back_path = args.write_back_path or resolve_default_write_back_path(args.sweep_mode)
     args = resolve_runtime_paths(args)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    run_log_path = args.output_dir / "sweep_run.log"
+    attach_file_logging(run_log_path)
     threshold_grid = resolve_threshold_grid(args.sweep_mode)
+    min_area_grid = resolve_min_area_grid(args.sweep_mode)
 
     device = resolve_device(args.device)
     LOGGER.info("sweep_mode=%s", args.sweep_mode)
@@ -324,6 +499,7 @@ def main():
         freeze_text=True,
     ).to(device)
     checkpoint, _, _ = load_checkpoint_flexible(model, args.checkpoint, device)
+    model.eval()
     tokenizer = load_tokenizer(args.tokenizer_dir)
     text_cache_payload = load_or_build_text_cache(
         model=model,
@@ -378,55 +554,97 @@ def main():
             len(records.get(class_name, [])),
             int(seen_counts.get(class_name, 0)),
         )
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    sample_counts = {class_name: len(records.get(class_name, [])) for class_name in CLASSES}
 
     best_thresholds = {}
     best_postprocess = {}
     best_scores = {}
+    best_metrics = {}
     summary_rows = []
 
     for class_name in maybe_tqdm(CLASSES, total=len(CLASSES), desc="Sweep classes", leave=False):
         best_iou = -1.0
-        best_cfg = default_cfg_for_class(class_name, threshold_grid)
+        best_cfg = default_cfg_for_class(class_name, threshold_grid, min_area_grid)
+        best_metric_cfg = {
+            "iou": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "pred_area": 0.0,
+            "gt_area": 0.0,
+        }
         samples = records.get(class_name, [])
 
         for threshold in threshold_grid[class_name]:
-            for min_area in MIN_AREA_GRID[class_name]:
+            for min_area in min_area_grid[class_name]:
                 fill_holes = bool(POSTPROCESS_DEFAULT[class_name]["fill_holes"])
-                ious = []
-                for sample in samples:
-                    logit = np.clip(sample["logit"], -50, 50)
-                    prob = 1.0 / (1.0 + np.exp(-logit))
-                    pred = (prob > threshold).astype(np.uint8)
-                    pred = apply_postprocess(pred, min_area=min_area, fill_holes=fill_holes)
-                    pred_t = torch.from_numpy(pred[None, None].astype(np.float32))
-                    mask_t = torch.from_numpy(sample["mask"][None, None].astype(np.float32))
-                    metrics = compute_metrics(pred_t, mask_t, threshold=0.5)
-                    ious.append(metrics["iou"])
+                for topk_components in resolve_topk_grid(class_name):
+                    metric_lists = defaultdict(list)
+                    for sample in samples:
+                        logit = np.asarray(sample["logit"], dtype=np.float32)
+                        logit = np.clip(logit, -50, 50)
+                        prob = 1.0 / (1.0 + np.exp(-logit))
+                        pred = (prob > threshold).astype(np.uint8)
+                        pred = apply_postprocess_with_topk(
+                            pred,
+                            min_area=min_area,
+                            fill_holes=fill_holes,
+                            topk_components=topk_components,
+                        )
+                        pred_t = torch.from_numpy(pred[None, None].astype(np.float32))
+                        gt = sample["mask"].astype(np.uint8)
+                        mask_t = torch.from_numpy(gt[None, None].astype(np.float32))
+                        metrics = compute_metrics(pred_t, mask_t, threshold=0.5)
+                        for metric_name in ["iou", "precision", "recall", "pred_area", "gt_area"]:
+                            metric_lists[metric_name].append(float(metrics[metric_name]))
 
-                score = float(np.mean(ious)) if ious else 0.0
-                summary_rows.append([class_name, threshold, min_area, fill_holes, score])
-                if score > best_iou:
-                    best_iou = score
-                    best_cfg = {
-                        "threshold": float(threshold),
-                        "min_area": int(min_area),
-                        "fill_holes": fill_holes,
+                    score = float(np.mean(metric_lists["iou"])) if metric_lists["iou"] else 0.0
+                    metric_cfg = {
+                        metric_name: float(np.mean(values)) if values else 0.0
+                        for metric_name, values in metric_lists.items()
                     }
+                    summary_rows.append([
+                        class_name,
+                        threshold,
+                        min_area,
+                        topk_components,
+                        fill_holes,
+                        metric_cfg.get("iou", 0.0),
+                        metric_cfg.get("precision", 0.0),
+                        metric_cfg.get("recall", 0.0),
+                        metric_cfg.get("pred_area", 0.0),
+                        metric_cfg.get("gt_area", 0.0),
+                    ])
+                    if score > best_iou:
+                        best_iou = score
+                        best_metric_cfg = metric_cfg
+                        best_cfg = {
+                            "threshold": float(threshold),
+                            "min_area": int(min_area),
+                            "fill_holes": fill_holes,
+                            "topk_components": topk_components,
+                        }
 
         best_thresholds[class_name] = best_cfg["threshold"]
-        best_postprocess[class_name] = {
+        best_post_cfg = {
             "min_area": best_cfg["min_area"],
             "fill_holes": best_cfg["fill_holes"],
         }
+        if best_cfg.get("topk_components") is not None:
+            best_post_cfg["topk_components"] = int(best_cfg["topk_components"])
+        best_postprocess[class_name] = best_post_cfg
         best_scores[class_name] = float(best_iou if best_iou >= 0.0 else 0.0)
+        best_metrics[class_name] = best_metric_cfg
         LOGGER.info(
-            "best %s: threshold=%.2f min_area=%s score=%.4f",
+            "best %s: threshold=%.2f min_area=%s topk_components=%s score=%.4f precision=%.4f recall=%.4f pred_area=%.2f gt_area=%.2f",
             class_name,
             best_thresholds[class_name],
             best_postprocess[class_name]["min_area"],
+            best_postprocess[class_name].get("topk_components"),
             best_scores[class_name],
+            best_metric_cfg["precision"],
+            best_metric_cfg["recall"],
+            best_metric_cfg["pred_area"],
+            best_metric_cfg["gt_area"],
         )
 
     best_metric = float(np.mean([best_scores[class_name] for class_name in CLASSES])) if CLASSES else 0.0
@@ -437,7 +655,7 @@ def main():
         json.dump(best_postprocess, file_obj, ensure_ascii=False, indent=2)
     with open(args.output_dir / "threshold_sweep_summary.csv", "w", newline="", encoding="utf-8") as file_obj:
         writer = csv.writer(file_obj)
-        writer.writerow(["class_name", "threshold", "min_area", "fill_holes", "mean_iou"])
+        writer.writerow(["class_name", "threshold", "min_area", "topk_components", "fill_holes", "mean_iou", "precision", "recall", "pred_area", "gt_area"])
         writer.writerows(summary_rows)
 
     if args.write_back_checkpoint:
@@ -457,33 +675,72 @@ def main():
     else:
         writeback_path = None
 
+    summary_payload = {
+        "sweep_mode": args.sweep_mode,
+        "checkpoint": str(args.checkpoint),
+        "text_cache_path": str(args.text_cache_path),
+        "img_size": img_size,
+        "write_back_checkpoint": bool(args.write_back_checkpoint),
+        "write_back_path": str(writeback_path) if writeback_path is not None else None,
+        "max_samples_per_class": args.max_samples_per_class,
+        "sample_counts": sample_counts,
+        "best_metric": best_metric,
+        "best_thresholds": best_thresholds,
+        "best_postprocess": best_postprocess,
+        "best_scores": best_scores,
+        "best_metrics": best_metrics,
+        "best_per_class": {
+            class_name: {
+                "sample_count": int(sample_counts.get(class_name, 0)),
+                "best_threshold": float(best_thresholds[class_name]),
+                "best_min_area": int(best_postprocess[class_name]["min_area"]),
+                "best_topk_components": best_postprocess[class_name].get("topk_components"),
+                "best_fill_holes": bool(best_postprocess[class_name]["fill_holes"]),
+                "best_iou": float(best_scores[class_name]),
+                "best_score": float(best_scores[class_name]),
+                "precision": float(best_metrics[class_name]["precision"]),
+                "recall": float(best_metrics[class_name]["recall"]),
+                "pred_area": float(best_metrics[class_name]["pred_area"]),
+                "gt_area": float(best_metrics[class_name]["gt_area"]),
+            }
+            for class_name in CLASSES
+        },
+        "best_thresholds_path": str(args.output_dir / "best_thresholds.json"),
+        "best_postprocess_path": str(args.output_dir / "best_postprocess.json"),
+        "run_log_path": str(run_log_path),
+    }
     save_json(
         args.output_dir / "sweep_summary.json",
-        {
-            "sweep_mode": args.sweep_mode,
-            "checkpoint": str(args.checkpoint),
-            "text_cache_path": str(args.text_cache_path),
-            "img_size": img_size,
-            "write_back_checkpoint": bool(args.write_back_checkpoint),
-            "write_back_path": str(writeback_path) if writeback_path is not None else None,
-            "max_samples_per_class": args.max_samples_per_class,
-            "best_metric": best_metric,
-            "best_thresholds": best_thresholds,
-            "best_postprocess": best_postprocess,
-            "best_thresholds_path": str(args.output_dir / "best_thresholds.json"),
-            "best_postprocess_path": str(args.output_dir / "best_postprocess.json"),
-        },
+        summary_payload,
     )
 
-    log_sweep_summary(
+    summary_lines = build_sweep_summary_lines(
         sweep_mode=args.sweep_mode,
         checkpoint_path=args.checkpoint,
+        max_samples_per_class=args.max_samples_per_class,
+        sample_counts=sample_counts,
         best_metric=best_metric,
         best_thresholds=best_thresholds,
         best_postprocess=best_postprocess,
+        best_scores=best_scores,
+        best_metrics=best_metrics,
         write_back_path=writeback_path,
         threshold_grid=threshold_grid,
+        min_area_grid=min_area_grid,
     )
+    cache_artifacts = persist_sweep_summary_cache(
+        output_dir=args.output_dir,
+        cache_dir=DEFAULT_SWEEP_CACHE_DIR,
+        checkpoint_path=args.checkpoint,
+        sweep_mode=args.sweep_mode,
+        summary_lines=summary_lines,
+        summary_payload=summary_payload,
+    )
+    log_sweep_summary(summary_lines)
+    LOGGER.info("sweep_run_log: %s", run_log_path)
+    LOGGER.info("summary_text_path: %s", cache_artifacts["output_summary_path"])
+    LOGGER.info("summary_cache_json: %s", cache_artifacts["cache_json_latest"])
+    LOGGER.info("summary_cache_text: %s", cache_artifacts["cache_text_latest"])
 
 
 if __name__ == "__main__":
