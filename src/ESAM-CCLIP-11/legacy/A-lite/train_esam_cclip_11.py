@@ -12,6 +12,19 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+CURRENT_DIR = str(Path(__file__).resolve().parent)
+ESAM_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = ESAM_ROOT.parents[1]
+if CURRENT_DIR in sys.path:
+    sys.path.remove(CURRENT_DIR)
+sys.path.insert(0, CURRENT_DIR)
+insert_index = 1
+for candidate in [str(ESAM_ROOT), str(PROJECT_ROOT)]:
+    if candidate in sys.path:
+        sys.path.remove(candidate)
+    sys.path.insert(insert_index, candidate)
+    insert_index += 1
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -84,16 +97,6 @@ from config_esam_cclip_11 import (
     WARMUP_EPOCHS,
 )
 
-THIS_DIR = Path(__file__).resolve().parent
-OPT_DIR = THIS_DIR.parent / "优化"
-PARENT_DIR = THIS_DIR.parent
-for candidate_dir in [OPT_DIR, PARENT_DIR]:
-    candidate_str = str(candidate_dir)
-    if candidate_str in sys.path:
-        sys.path.remove(candidate_str)
-sys.path.insert(0, str(PARENT_DIR))
-sys.path.insert(0, str(OPT_DIR))
-
 from common_esam_cclip_11 import (
     DiceLoss,
     ESAMCCLIPModel,
@@ -107,6 +110,7 @@ from common_esam_cclip_11 import (
 )
 from dataset_esam_cclip_11 import ESAMCCLIP11Dataset
 from model_esam_cclip_11 import load_checkpoint_flexible
+from path_utils import ensure_dir, ensure_file, resolve_project_path
 from prompt_prototypes import load_or_build_text_cache
 
 # =========================
@@ -214,6 +218,7 @@ def build_argparser():
     parser.add_argument("--build_image_cache", action="store_true", default=False)
     parser.add_argument("--rebuild_image_cache", action="store_true", default=REBUILD_IMAGE_CACHE)
     parser.add_argument("--negative_sample_ratio", type=float, default=NEGATIVE_SAMPLE_RATIO)
+    parser.add_argument("--negative_sample_weight", type=float, default=NEGATIVE_SAMPLE_WEIGHT)
     parser.add_argument("--old_class_sample_ratio", type=float, default=OLD_CLASS_SAMPLE_RATIO)
     parser.add_argument("--rare_class_keep_ratio", type=float, default=RARE_CLASS_KEEP_RATIO)
     parser.add_argument("--train_eval_after", action="store_true", default=False)
@@ -231,6 +236,31 @@ def build_argparser():
         use_prompt_prototype=USE_PROMPT_PROTOTYPE,
     )
     return parser
+
+
+def resolve_runtime_paths(args):
+    args.train_json = ensure_file(args.train_json, "train_json")
+    args.all_json = ensure_file(args.all_json, "all_json")
+    args.image_root = ensure_dir(args.image_root, "image_root")
+    args.tokenizer_dir = ensure_dir(args.tokenizer_dir, "tokenizer_dir")
+    args.efficient_sam_ckpt = ensure_file(args.efficient_sam_ckpt, "efficient_sam_ckpt")
+    args.output_dir = resolve_project_path(args.output_dir)
+    args.text_cache_path = resolve_project_path(args.text_cache_path)
+    args.image_cache_dir = resolve_project_path(args.image_cache_dir)
+    if args.train_list is not None:
+        args.train_list = ensure_file(args.train_list, "train_list")
+    if not args.no_val:
+        args.val_json = ensure_file(args.val_json, "val_json")
+        if args.val_list is not None:
+            args.val_list = ensure_file(args.val_list, "val_list")
+    else:
+        args.val_json = resolve_project_path(args.val_json)
+        args.val_list = resolve_project_path(args.val_list) if args.val_list is not None else None
+    if args.resume is not None:
+        args.resume = ensure_file(args.resume, "resume")
+    if args.resume_best is not None:
+        args.resume_best = ensure_file(args.resume_best, "resume_best")
+    return args
 
 
 def collate_fn(batch):
@@ -260,7 +290,7 @@ def build_datasets(args):
         hflip_prob=effective_hflip_prob,
         use_conf_filter=False,
         negative_sample_prob=args.negative_sample_ratio if INCLUDE_NEGATIVE_SAMPLES else 0.0,
-        negative_sample_weight=NEGATIVE_SAMPLE_WEIGHT,
+        negative_sample_weight=args.negative_sample_weight,
         rare_oversample=RARE_OVERSAMPLE,
         old_class_sample_ratio=args.old_class_sample_ratio,
         rare_class_keep_ratio=args.rare_class_keep_ratio,
@@ -285,7 +315,7 @@ def build_datasets(args):
             hflip_prob=0.0,
             use_conf_filter=False,
             negative_sample_prob=0.0 if not VAL_INCLUDE_NEGATIVE_SAMPLES else args.negative_sample_ratio,
-            negative_sample_weight=NEGATIVE_SAMPLE_WEIGHT,
+            negative_sample_weight=args.negative_sample_weight,
             rare_oversample=None,
             old_class_sample_ratio=1.0,
             rare_class_keep_ratio=1.0,
@@ -720,7 +750,7 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
 
 def main():
     parser = build_argparser()
-    args = parser.parse_args()
+    args = resolve_runtime_paths(parser.parse_args())
     args.output_dir = args.output_dir.resolve()
     run_dir = args.output_dir / args.run_name
     configure_logging(run_dir / f"{args.run_name}.log")
@@ -956,7 +986,7 @@ def main():
             hflip_prob=0.0,
             use_conf_filter=False,
             negative_sample_prob=0.0,
-            negative_sample_weight=NEGATIVE_SAMPLE_WEIGHT,
+            negative_sample_weight=args.negative_sample_weight,
             rare_oversample=None,
             old_class_sample_ratio=1.0,
             rare_class_keep_ratio=1.0,

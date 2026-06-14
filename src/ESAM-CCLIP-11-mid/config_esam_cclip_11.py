@@ -102,9 +102,9 @@ MIN_AREA_GRID = {
 # Data
 # =========================
 IMAGE_ROOT = ROOT
-TRAIN_JSON = ROOT / "test" / "clean_rare" / "label" / "all-nocomputer.json"
-VAL_JSON = ROOT / "test" / "clean_rare" / "label" / "val-nocomputer.json"
-ALL_JSON = ROOT / "test" / "clean_rare" / "label" / "all-nocomputer.json"
+TRAIN_JSON = ROOT / "test" / "clean_rare" / "label" / "train_label.json"
+VAL_JSON = ROOT / "test" / "clean_rare" / "label" / "val-label.json"
+ALL_JSON = ROOT / "test" / "clean_rare" / "label" / "trainval_label.json"
 TRAIN_LIST = ROOT / "test" / "trainval_list.txt"
 VAL_LIST = ROOT / "test" / "val_list.txt"
 TOKENIZER_DIR = HANXUE_ROOT / "weights" / "chinese_clip"

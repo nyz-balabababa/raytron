@@ -8,6 +8,19 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+CURRENT_DIR = str(Path(__file__).resolve().parent)
+ESAM_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = ESAM_ROOT.parents[1]
+if CURRENT_DIR in sys.path:
+    sys.path.remove(CURRENT_DIR)
+sys.path.insert(0, CURRENT_DIR)
+insert_index = 1
+for candidate in [str(ESAM_ROOT), str(PROJECT_ROOT)]:
+    if candidate in sys.path:
+        sys.path.remove(candidate)
+    sys.path.insert(insert_index, candidate)
+    insert_index += 1
+
 import numpy as np
 import torch
 
@@ -17,25 +30,15 @@ from config_esam_cclip_11 import (
     EFFICIENT_SAM_CKPT,
     IMAGE_ROOT,
     MIN_AREA_GRID,
-    OUTPUT_ROOT,
     POSTPROCESS_DEFAULT,
     PROMPT_PROTOTYPES,
+    RUN_NAME,
     TEXT_CACHE_PATH,
     THRESH_GRID,
     TOKENIZER_DIR,
     VAL_JSON,
     VAL_LIST,
 )
-
-THIS_DIR = Path(__file__).resolve().parent
-OPT_DIR = THIS_DIR.parent / "优化"
-PARENT_DIR = THIS_DIR.parent
-for candidate_dir in [OPT_DIR, PARENT_DIR]:
-    candidate_str = str(candidate_dir)
-    if candidate_str in sys.path:
-        sys.path.remove(candidate_str)
-sys.path.insert(0, str(PARENT_DIR))
-sys.path.insert(0, str(OPT_DIR))
 
 from common_esam_cclip_11 import (
     ESAMCCLIPModel,
@@ -48,6 +51,7 @@ from common_esam_cclip_11 import (
 )
 from dataset_esam_cclip_11 import ESAMCCLIP11Dataset
 from model_esam_cclip_11 import load_checkpoint_flexible
+from path_utils import ensure_dir, ensure_file, resolve_project_path
 from prompt_prototypes import load_or_build_text_cache
 
 LOGGER = logging.getLogger("ESAM_CCLIP_11_SWEEP")
@@ -56,16 +60,16 @@ LOGGER = logging.getLogger("ESAM_CCLIP_11_SWEEP")
 # Quick Run Config
 # 直接改这里，然后在 IDE 里运行本脚本即可
 # =========================
-DEFAULT_CHECKPOINT = OUTPUT_ROOT / "ESAM-CCLIP-11-old-balanced" / "final_fullset.pt"
+DEFAULT_CHECKPOINT = Path("test/train_output") / RUN_NAME / "final_fullset.pt"
 DEFAULT_VAL_JSON = VAL_JSON
 DEFAULT_VAL_LIST = VAL_LIST
 DEFAULT_IMAGE_ROOT = IMAGE_ROOT
 DEFAULT_TOKENIZER_DIR = TOKENIZER_DIR
-DEFAULT_TEXT_CACHE_PATH = TEXT_CACHE_PATH.with_name("text_emb_11_old_balanced.pt")
-DEFAULT_OUTPUT_DIR = Path("test/train_output/threshold_sweep_esam_11_old_balanced")
+DEFAULT_TEXT_CACHE_PATH = TEXT_CACHE_PATH.with_name("text_emb_11_rare_balanced.pt")
+DEFAULT_OUTPUT_DIR = Path("test/train_output/threshold_sweep_esam_11_rare_balanced")
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEFAULT_WRITE_BACK_CHECKPOINT = True
-DEFAULT_WRITE_BACK_PATH = Path("model/submit-rsam-old-balanced/sam3.pt")
+DEFAULT_WRITE_BACK_PATH = Path("model/submit-rsam-rare-balanced/sam3.pt")
 DEFAULT_REBUILD_TEXT_CACHE = True
 DEFAULT_MAX_SAMPLES_PER_CLASS = 500
 
@@ -134,7 +138,7 @@ def collect_validation_logits(model, dataset, tokenizer, text_cache_payload, dev
 
 
 def build_argparser():
-    parser = argparse.ArgumentParser(description="Sweep thresholds for ESAM-CCLIP-11 old-balanced")
+    parser = argparse.ArgumentParser(description="Sweep thresholds for ESAM-CCLIP-11 rare-balanced")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--val_json", type=Path, default=DEFAULT_VAL_JSON)
     parser.add_argument("--val_list", type=Path, default=DEFAULT_VAL_LIST)
@@ -152,10 +156,23 @@ def build_argparser():
     return parser
 
 
+def resolve_runtime_paths(args):
+    args.checkpoint = ensure_file(args.checkpoint, "checkpoint")
+    args.val_json = ensure_file(args.val_json, "val_json")
+    if args.val_list is not None:
+        args.val_list = ensure_file(args.val_list, "val_list")
+    args.image_root = ensure_dir(args.image_root, "image_root")
+    args.tokenizer_dir = ensure_dir(args.tokenizer_dir, "tokenizer_dir")
+    args.text_cache_path = resolve_project_path(args.text_cache_path)
+    args.output_dir = resolve_project_path(args.output_dir)
+    args.write_back_path = resolve_project_path(args.write_back_path)
+    return args
+
+
 def main():
     configure_logging()
     parser = build_argparser()
-    args = parser.parse_args()
+    args = resolve_runtime_paths(parser.parse_args())
 
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"checkpoint 不存在: {args.checkpoint}")

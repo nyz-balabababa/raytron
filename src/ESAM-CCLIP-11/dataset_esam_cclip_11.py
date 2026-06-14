@@ -10,7 +10,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from config_esam_cclip_11 import CONF_FILTER, LOSS_WEIGHT_FLOOR, PROMPT_AUG_PROB
+from config_esam_cclip_11 import (
+    CONF_FILTER,
+    LOSS_WEIGHT_FLOOR,
+    PROMPT_AUG_PROB,
+    RARE_BALANCED_OLD_CLASSES,
+    RARE_BALANCED_RARE_CLASSES,
+)
 from common_esam_cclip_11 import (
     letterbox_image,
     letterbox_mask,
@@ -39,9 +45,17 @@ class ESAMCCLIP11Dataset(Dataset):
         negative_sample_prob=0.0,
         negative_sample_weight=0.30,
         rare_oversample=None,
+        old_class_sample_ratio=1.0,
+        rare_class_keep_ratio=1.0,
+        old_classes=None,
+        rare_classes=None,
+        rare_balance_enabled=False,
         training=True,
         seed=42,
+        **extra_kwargs,
     ):
+        if extra_kwargs:
+            LOGGER.warning("忽略未使用的 dataset kwargs: %s", sorted(extra_kwargs.keys()))
         self.annotation_json = resolve_existing_path(annotation_json)
         self.split_txt = resolve_existing_path(split_txt) if split_txt is not None else None
         self.image_root = resolve_existing_path(image_root)
@@ -56,6 +70,11 @@ class ESAMCCLIP11Dataset(Dataset):
         self.negative_sample_prob = negative_sample_prob
         self.negative_sample_weight = negative_sample_weight
         self.rare_oversample = rare_oversample or {}
+        self.old_class_sample_ratio = float(old_class_sample_ratio)
+        self.rare_class_keep_ratio = float(rare_class_keep_ratio)
+        self.old_classes = set(old_classes or RARE_BALANCED_OLD_CLASSES)
+        self.rare_classes = set(rare_classes or RARE_BALANCED_RARE_CLASSES)
+        self.rare_balance_enabled = bool(training and rare_balance_enabled)
         self.training = training
         self.rng = random.Random(seed)
         self.allowed = self._load_allowed_set()
@@ -64,6 +83,9 @@ class ESAMCCLIP11Dataset(Dataset):
         LOGGER.info("total samples=%d", self.stats["total"])
         LOGGER.info("positive stats=%s", self.stats["positive"])
         LOGGER.info("negative stats=%s", self.stats["negative"])
+        LOGGER.info("positive_raw=%s", self.stats.get("positive_raw", {}))
+        LOGGER.info("positive_rebalanced=%s", self.stats.get("positive_rebalanced", {}))
+        LOGGER.info("rebalance=%s", self.stats.get("rebalance", {}))
         LOGGER.info("filtered_computer=%d", self.stats["filtered_computer"])
         LOGGER.info("filtered_invalid_prompt=%d", self.stats["filtered_invalid_prompt"])
         LOGGER.info("filtered_disabled=%d", self.stats["filtered_disabled"])
@@ -100,12 +122,21 @@ class ESAMCCLIP11Dataset(Dataset):
     def _score_threshold(self, prompt):
         return CONF_FILTER.get(str(prompt), 0.5)
 
+    def _should_keep_positive(self, prompt: str) -> bool:
+        if not self.rare_balance_enabled:
+            return True
+        if prompt in self.old_classes:
+            return self.rng.random() < self.old_class_sample_ratio
+        if prompt in self.rare_classes:
+            return self.rng.random() < self.rare_class_keep_ratio
+        return True
+
     def _build_samples(self):
         with open(self.annotation_json, "r", encoding="utf-8-sig") as file_obj:
             preds = json.load(file_obj)
 
         base_samples = []
-        class_pos_counter = Counter()
+        class_pos_counter_raw = Counter()
         class_neg_counter = Counter()
         filtered_computer = 0
         filtered_invalid_prompt = 0
@@ -172,7 +203,7 @@ class ESAMCCLIP11Dataset(Dataset):
                             "ann_id": ann_id,
                         }
                     )
-                    class_pos_counter[prompt] += 1
+                    class_pos_counter_raw[prompt] += 1
                 else:
                     if self.negative_sample_prob > 0 and self.rng.random() < self.negative_sample_prob:
                         base_samples.append(
@@ -187,24 +218,49 @@ class ESAMCCLIP11Dataset(Dataset):
                         )
                         class_neg_counter[prompt] += 1
 
+        rebalance_stats = {
+            "old_positive_kept": 0,
+            "old_positive_dropped": 0,
+            "rare_positive_kept": 0,
+            "rare_positive_dropped": 0,
+            "old_class_sample_ratio": self.old_class_sample_ratio,
+            "rare_class_keep_ratio": self.rare_class_keep_ratio,
+            "rare_balance_enabled": self.rare_balance_enabled,
+        }
+        positives = [sample for sample in base_samples if sample["is_positive"]]
+        negatives = [sample for sample in base_samples if not sample["is_positive"]]
+        kept_positives = []
+        for sample in positives:
+            prompt = sample["prompt"]
+            keep = self._should_keep_positive(prompt)
+            if prompt in self.old_classes:
+                rebalance_stats["old_positive_kept" if keep else "old_positive_dropped"] += 1
+            elif prompt in self.rare_classes:
+                rebalance_stats["rare_positive_kept" if keep else "rare_positive_dropped"] += 1
+            if keep:
+                kept_positives.append(sample)
+        base_samples = kept_positives + negatives
+
         if self.rare_oversample:
             extra = []
-            for sample in base_samples:
-                if not sample["is_positive"]:
-                    continue
+            for sample in kept_positives:
                 mult = int(self.rare_oversample.get(sample["prompt"], 1))
                 for _ in range(max(mult - 1, 0)):
                     extra.append(sample.copy())
             base_samples.extend(extra)
 
+        class_pos_counter = Counter(sample["prompt"] for sample in base_samples if sample["is_positive"])
         stats = {
             "positive": dict(class_pos_counter),
+            "positive_raw": dict(class_pos_counter_raw),
+            "positive_rebalanced": dict(class_pos_counter),
             "negative": dict(class_neg_counter),
             "total": len(base_samples),
             "filtered_computer": filtered_computer,
             "filtered_invalid_prompt": filtered_invalid_prompt,
             "filtered_disabled": filtered_disabled,
             "empty_mask": empty_mask_count,
+            "rebalance": rebalance_stats,
         }
         return base_samples, stats
 

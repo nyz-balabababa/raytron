@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -35,7 +35,7 @@ DEFAULT_CHECKPOINT_PATH = "/raytron/code/model/sam3.pt"
 
 DEFAULT_MASK_THRESHOLD = 0.5
 DEFAULT_SUBMIT_IMG_SIZE = 768
-PROMPT_BATCH_SIZE = 16
+PROMPT_BATCH_SIZE = 8
 MAX_TEXT_LEN = 15
 
 DEFAULT_CLASSES = [
@@ -62,7 +62,7 @@ DEFAULT_PROMPT_PROTOTYPES = {
     "window": ["window", "窗户"],
     "door": ["door", "entrance", "门"],
     "fence": ["fence", "railing", "栏杆", "围栏"],
-    "pole_light": ["pole_light", "pole light", "street light", "lamp", "light pole", "路灯", "灯杆"],
+    "pole_light": ["pole_light", "street light", "lamp", "light pole", "路灯", "灯杆"],
     "motorcycle": ["motorcycle", "motorbike", "摩托车"],
 }
 
@@ -560,13 +560,7 @@ def logits_to_mask(
     elif logits.ndim == 3:
         logits = logits.unsqueeze(1)
 
-    if logits.shape[-2:] != (input_size, input_size):
-        logits = F.interpolate(
-            logits,
-            size=(input_size, input_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+    logits = F.interpolate(logits, size=(input_size, input_size), mode="bilinear", align_corners=False)
     prob = torch.sigmoid(logits[0, 0]).detach().cpu().numpy()
 
     top = meta["pad_top"]
@@ -749,18 +743,6 @@ def load_or_build_text_cache(
         },
     )
     LOGGER.info("text cache saved: %s", cache_path)
-    return payload
-
-
-def move_text_cache_to_device(
-    payload: Dict[str, Any],
-    device: torch.device,
-) -> Dict[str, Any]:
-    embeddings = payload.get("embeddings", {})
-    payload["device_embeddings"] = {
-        class_name: embedding.to(device, non_blocking=True)
-        for class_name, embedding in embeddings.items()
-    }
     return payload
 
 
@@ -1007,12 +989,11 @@ def build_text_feature_for_prompt(
     cache_key = str(prompt_text).strip()
     if prompt_feature_cache is not None and cache_key in prompt_feature_cache:
         cached_feature, cached_mapped_class = prompt_feature_cache[cache_key]
-        return cached_feature.to(device, non_blocking=True), cached_mapped_class
+        return cached_feature.to(device), cached_mapped_class
 
     mapped_class = map_prompt_to_known_class(prompt_text, prompt_aliases)
-    device_embeddings = text_cache_payload.get("device_embeddings", {})
-    if mapped_class is not None and mapped_class in device_embeddings:
-        feature = device_embeddings[mapped_class]
+    if mapped_class is not None and mapped_class in text_cache_payload.get("embeddings", {}):
+        feature = text_cache_payload["embeddings"][mapped_class].to(device)
         if feature.ndim == 1:
             feature = feature.unsqueeze(0)
         resolved = feature[0], mapped_class
@@ -1185,7 +1166,6 @@ def load_model(
         prompt_prototypes=prompt_prototypes,
         device=device,
     )
-    text_cache_payload = move_text_cache_to_device(text_cache_payload, device)
     model.eval()
     model_input_size = int(checkpoint.get("img_size", DEFAULT_SUBMIT_IMG_SIZE)) if isinstance(checkpoint, dict) else DEFAULT_SUBMIT_IMG_SIZE
     return model, tokenizer, text_cache_payload, model_input_size, checkpoint, classes, prompt_aliases
@@ -1207,7 +1187,7 @@ def do_inference(
 ) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     device = next(model.parameters()).device
     image_tensor, meta = preprocess_image(image_path, model_input_size)
-    image_embedding = model.encode_image(image_tensor.unsqueeze(0).to(device, non_blocking=True))
+    image_embedding = model.encode_image(image_tensor.unsqueeze(0).to(device))
     results_by_prompt: Dict[str, Dict[str, Any]] = {}
 
     for start in range(0, len(text_prompts), PROMPT_BATCH_SIZE):
@@ -1230,8 +1210,8 @@ def do_inference(
         if not feature_list:
             continue
 
-        text_features = torch.stack(feature_list, dim=0).to(device, non_blocking=True)
-        image_batch = image_embedding.expand(text_features.size(0), -1, -1, -1)
+        text_features = torch.stack(feature_list, dim=0).to(device)
+        image_batch = image_embedding.expand(text_features.size(0), -1, -1, -1).contiguous()
         logits = model.decode(
             image_features=image_batch,
             text_features=text_features,
@@ -1446,10 +1426,6 @@ def process_tasks(
 
 def main() -> None:
     configure_logging()
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", type=str, default=DEFAULT_TASKS)
     parser.add_argument("--images_root", type=str, default=DEFAULT_IMAGE_ROOT)
@@ -1496,3 +1472,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

@@ -11,6 +11,12 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+ESAM_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ESAM_ROOT.parents[1]
+for candidate in [str(ESAM_ROOT), str(PROJECT_ROOT)]:
+    if candidate not in sys.path:
+        sys.path.insert(0, candidate)
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,6 +30,7 @@ from torch.utils.data import DataLoader, Subset
 from config_esam_cclip_11 import (
     ALL_JSON,
     AMP,
+    apply_preset,
     BATCH_SIZE,
     BCE_WEIGHT,
     CLASS_TO_IDX,
@@ -55,10 +62,16 @@ from config_esam_cclip_11 import (
     NEGATIVE_SAMPLE_RATIO,
     NEGATIVE_SAMPLE_WEIGHT,
     OLD5_CLASSES,
+    OLD_CLASS_SAMPLE_RATIO,
     OUTPUT_ROOT,
+    PRESET_CHOICES,
     POSTPROCESS_DEFAULT,
+    PROMPT_THRESHOLDS,
     PROMPT_PROTOTYPES,
     RARE_CLASSES,
+    RARE_BALANCED_OLD_CLASSES,
+    RARE_BALANCED_RARE_CLASSES,
+    RARE_CLASS_KEEP_RATIO,
     RARE_OVERSAMPLE,
     REBUILD_IMAGE_CACHE,
     REBUILD_TEXT_CACHE,
@@ -92,6 +105,7 @@ from common_esam_cclip_11 import (
 )
 from dataset_esam_cclip_11 import ESAMCCLIP11Dataset
 from model_esam_cclip_11 import load_checkpoint_flexible
+from path_utils import ensure_dir, ensure_file, resolve_project_path
 from prompt_prototypes import load_or_build_text_cache
 
 # =========================
@@ -123,6 +137,7 @@ def set_seed(seed: int):
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="ESAM-CCLIP-11 fast finetune")
+    parser.add_argument("--preset", choices=PRESET_CHOICES, default="base")
     parser.add_argument("--train_json", type=Path, default=TRAIN_JSON)
     parser.add_argument("--val_json", type=Path, default=VAL_JSON)
     parser.add_argument("--all_json", type=Path, default=ALL_JSON)
@@ -140,13 +155,15 @@ def build_argparser():
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--workers", type=int, default=WORKERS)
     parser.add_argument("--no_val", action="store_true", default=False)
+    parser.add_argument("--with_val", dest="no_val", action="store_false")
     parser.add_argument("--no_train_split_filter", action="store_true", default=False)
+    parser.add_argument("--use_train_split_filter", dest="no_train_split_filter", action="store_false")
     parser.add_argument("--amp", dest="amp", action="store_true")
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument(
         "--resume_best",
         type=Path,
-        default=DEFAULT_RESUME_BEST if DEFAULT_RESUME_BEST.exists() else None,
+        default=None,
     )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--resume_weights_only", action="store_true", default=False)
@@ -165,6 +182,11 @@ def build_argparser():
     parser.add_argument("--build_image_cache", action="store_true", default=False)
     parser.add_argument("--rebuild_image_cache", action="store_true", default=REBUILD_IMAGE_CACHE)
     parser.add_argument("--negative_sample_ratio", type=float, default=NEGATIVE_SAMPLE_RATIO)
+    parser.add_argument("--negative_sample_weight", type=float, default=NEGATIVE_SAMPLE_WEIGHT)
+    parser.add_argument("--old_class_sample_ratio", type=float, default=OLD_CLASS_SAMPLE_RATIO)
+    parser.add_argument("--rare_class_keep_ratio", type=float, default=RARE_CLASS_KEEP_RATIO)
+    parser.add_argument("--rare_balance_enabled", dest="rare_balance_enabled", action="store_true")
+    parser.add_argument("--no_rare_balance_enabled", dest="rare_balance_enabled", action="store_false")
     parser.add_argument("--train_eval_after", action="store_true", default=False)
     parser.add_argument("--train_eval_max_samples", type=int, default=3000)
     parser.add_argument("--train_eval_batch_size", type=int, default=None)
@@ -173,13 +195,54 @@ def build_argparser():
     parser.add_argument("--image_lr", type=float, default=IMAGE_LR)
     parser.add_argument("--text_lr", type=float, default=0.0)
     parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--warmup_epochs", type=int, default=WARMUP_EPOCHS)
+    parser.add_argument("--min_lr_ratio", type=float, default=MIN_LR_RATIO)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.set_defaults(
         amp=AMP,
         freeze_image_encoder=FREEZE_IMAGE_ENCODER,
         use_prompt_prototype=USE_PROMPT_PROTOTYPE,
+        rare_balance_enabled=False,
     )
     return parser
+
+
+def collect_explicit_dests(parser, argv):
+    explicit_dests = set()
+    for token in argv:
+        if not token.startswith("-"):
+            continue
+        option = token.split("=", 1)[0]
+        for action in parser._actions:
+            if option in action.option_strings:
+                explicit_dests.add(action.dest)
+                break
+    return explicit_dests
+
+
+def resolve_runtime_paths(args):
+    args.train_json = ensure_file(args.train_json, "train_json")
+    args.all_json = resolve_project_path(args.all_json)
+    args.image_root = ensure_dir(args.image_root, "image_root")
+    args.tokenizer_dir = ensure_dir(args.tokenizer_dir, "tokenizer_dir")
+    args.efficient_sam_ckpt = ensure_file(args.efficient_sam_ckpt, "efficient_sam_ckpt")
+    args.output_dir = resolve_project_path(args.output_dir)
+    args.text_cache_path = resolve_project_path(args.text_cache_path)
+    args.image_cache_dir = resolve_project_path(args.image_cache_dir)
+    if args.train_list is not None:
+        args.train_list = ensure_file(args.train_list, "train_list")
+    if not args.no_val:
+        args.val_json = ensure_file(args.val_json, "val_json")
+        if args.val_list is not None:
+            args.val_list = ensure_file(args.val_list, "val_list")
+    else:
+        args.val_json = resolve_project_path(args.val_json)
+        args.val_list = resolve_project_path(args.val_list) if args.val_list is not None else None
+    if args.resume is not None:
+        args.resume = ensure_file(args.resume, "resume")
+    if args.resume_best is not None:
+        args.resume_best = ensure_file(args.resume_best, "resume_best")
+    return args
 
 
 def collate_fn(batch):
@@ -204,13 +267,18 @@ def build_datasets(args):
         image_root=args.image_root,
         img_size=(args.img_size, args.img_size),
         classes=CLASSES,
-        prompt_prototypes=PROMPT_PROTOTYPES,
+        prompt_prototypes=args.prompt_prototype_cfg,
         augment_prompt=False,
         hflip_prob=effective_hflip_prob,
         use_conf_filter=False,
         negative_sample_prob=args.negative_sample_ratio if INCLUDE_NEGATIVE_SAMPLES else 0.0,
-        negative_sample_weight=NEGATIVE_SAMPLE_WEIGHT,
-        rare_oversample=RARE_OVERSAMPLE,
+        negative_sample_weight=args.negative_sample_weight,
+        rare_oversample=args.rare_oversample,
+        old_class_sample_ratio=args.old_class_sample_ratio,
+        rare_class_keep_ratio=args.rare_class_keep_ratio,
+        old_classes=args.old_classes,
+        rare_classes=args.rare_classes,
+        rare_balance_enabled=args.rare_balance_enabled,
         training=True,
         seed=args.seed,
     )
@@ -225,13 +293,18 @@ def build_datasets(args):
             image_root=args.image_root,
             img_size=(args.img_size, args.img_size),
             classes=CLASSES,
-            prompt_prototypes=PROMPT_PROTOTYPES,
+            prompt_prototypes=args.prompt_prototype_cfg,
             augment_prompt=False,
             hflip_prob=0.0,
             use_conf_filter=False,
-            negative_sample_prob=0.0 if not VAL_INCLUDE_NEGATIVE_SAMPLES else args.negative_sample_ratio,
-            negative_sample_weight=NEGATIVE_SAMPLE_WEIGHT,
+            negative_sample_prob=0.0,
+            negative_sample_weight=0.0,
             rare_oversample=None,
+            old_class_sample_ratio=1.0,
+            rare_class_keep_ratio=1.0,
+            old_classes=args.old_classes,
+            rare_classes=args.rare_classes,
+            rare_balance_enabled=False,
             training=False,
             seed=args.seed,
         )
@@ -288,8 +361,8 @@ def build_scheduler(optimizer, total_steps, warmup_steps, min_lr_ratio):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def class_weight_tensor(class_names, device):
-    weights = [CLASS_WEIGHTS.get(name, 1.0) for name in class_names]
+def class_weight_tensor(class_names, device, class_weights):
+    weights = [class_weights.get(name, 1.0) for name in class_names]
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
@@ -376,7 +449,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion_dice, criteri
             bce_map = F.binary_cross_entropy_with_logits(logits, masks, reduction="none").mean(dim=(1, 2, 3))
             dice_val = torch.stack([criterion_dice(logits[i: i + 1], masks[i: i + 1]) for i in range(logits.size(0))], dim=0).view(-1)
             focal_val = torch.stack([criterion_focal(logits[i: i + 1], masks[i: i + 1]) for i in range(logits.size(0))], dim=0).view(-1)
-            cls_weights = class_weight_tensor(class_names, device)
+            cls_weights = class_weight_tensor(class_names, device, args.class_weights)
             weighted = (BCE_WEIGHT * bce_map + DICE_WEIGHT * dice_val + FOCAL_WEIGHT * focal_val) * sample_weight * cls_weights
             loss = weighted.mean()
 
@@ -592,10 +665,24 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "class_to_idx": CLASS_TO_IDX,
         "idx_to_class": {idx: cls for idx, cls in enumerate(CLASSES)},
         "model_type": MODEL_TYPE,
+        "preset": args.preset,
         "use_prompt_prototype": args.use_prompt_prototype,
         "prompt_prototypes": args.prompt_prototype_cfg,
+        "prompt_thresholds": PROMPT_THRESHOLDS,
         "val_thresholds": VAL_THRESHOLDS,
+        "postprocess": POSTPROCESS_DEFAULT,
         "postprocess_cfg": POSTPROCESS_DEFAULT,
+        "class_weights": args.class_weights,
+        "rare_oversample": args.rare_oversample,
+        "negative_sample_ratio": args.negative_sample_ratio,
+        "negative_sample_weight": args.negative_sample_weight,
+        "old_class_sample_ratio": args.old_class_sample_ratio,
+        "rare_class_keep_ratio": args.rare_class_keep_ratio,
+        "rare_balance_enabled": args.rare_balance_enabled,
+        "train_json": str(args.train_json),
+        "val_json": str(args.val_json) if args.val_json is not None else None,
+        "train_list": str(args.train_list) if args.train_list is not None else None,
+        "val_list": str(args.val_list) if args.val_list is not None else None,
         "img_size": int(args.img_size),
         "esam_input_size": int(args.esam_input_size),
         "text_cache_path": str(args.text_cache_path),
@@ -630,7 +717,7 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
 
     if args.resume_weights_only:
         LOGGER.info("resume_weights_only=True，仅恢复模型权重，不恢复 optimizer/scheduler/epoch/history。")
-        return 1, defaultdict(list), {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0}, checkpoint
+        return 1, defaultdict(list), {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0}, checkpoint
 
     optimizer_state = checkpoint.get("optimizer_state_dict")
     if optimizer_state:
@@ -641,7 +728,7 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
 
     if args.reset_history:
         history = defaultdict(list)
-        best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0}
+        best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0}
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         LOGGER.info("reset_history=True，已清空 history/best_metrics，从 epoch %d 继续训练。", start_epoch)
     else:
@@ -651,7 +738,7 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
             history[key] = list(values)
         best_metrics = checkpoint.get(
             "best_metrics",
-            {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0},
+            {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0},
         )
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         LOGGER.info("已恢复 epoch=%d, 下一轮从 epoch %d 开始。", int(checkpoint.get("epoch", 0)), start_epoch)
@@ -661,7 +748,9 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
 
 def main():
     parser = build_argparser()
-    args = parser.parse_args()
+    explicit_dests = collect_explicit_dests(parser, sys.argv[1:])
+    args = apply_preset(parser.parse_args(), explicit_dests)
+    args = resolve_runtime_paths(args)
     args.output_dir = args.output_dir.resolve()
     run_dir = args.output_dir / args.run_name
     configure_logging(run_dir / f"{args.run_name}.log")
@@ -672,7 +761,9 @@ def main():
     if args.use_image_cache:
         LOGGER.info("use_image_cache=True，训练阶段已强制关闭随机 hflip。")
 
-    LOGGER.info("loaded checkpoint path=%s", args.resume_best)
+    LOGGER.info("preset=%s", args.preset)
+    LOGGER.info("run_name=%s", args.run_name)
+    LOGGER.info("resume_best=%s", args.resume_best)
     LOGGER.info("train_json=%s", args.train_json)
     LOGGER.info("val_json=%s", args.val_json)
     LOGGER.info("train_list=%s", args.train_list)
@@ -687,8 +778,20 @@ def main():
     LOGGER.info("train_decoder_only=%s", args.train_decoder_only)
     LOGGER.info("use_prompt_prototype=%s", args.use_prompt_prototype)
     LOGGER.info("use_image_cache=%s", args.use_image_cache)
+    LOGGER.info("epochs=%s", args.epochs)
     LOGGER.info("decoder_lr=%s image_lr=%s text_lr=%s", args.decoder_lr, args.image_lr, args.text_lr)
+    LOGGER.info("warmup_epochs=%s", args.warmup_epochs)
+    LOGGER.info("min_lr_ratio=%s", args.min_lr_ratio)
     LOGGER.info("current classes=%s", CLASSES)
+    LOGGER.info("negative_sample_ratio=%s", args.negative_sample_ratio)
+    LOGGER.info("negative_sample_weight=%s", args.negative_sample_weight)
+    LOGGER.info("old_class_sample_ratio=%s", args.old_class_sample_ratio)
+    LOGGER.info("rare_class_keep_ratio=%s", args.rare_class_keep_ratio)
+    LOGGER.info("rare_balance_enabled=%s", args.rare_balance_enabled)
+    LOGGER.info("rare_oversample=%s", args.rare_oversample)
+    LOGGER.info("class_weights=%s", args.class_weights)
+    if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset"} and args.resume is None and args.resume_best is None:
+        LOGGER.warning("preset=%s 建议显式传入 --resume_best 或 --resume 作为热启动起点。", args.preset)
     if args.no_val:
         LOGGER.info("当前使用全集训练直接提交模式，不使用验证集选择 best checkpoint，最终请使用 final_fullset.pt 或 last.pt。")
         if args.no_train_split_filter:
@@ -780,15 +883,15 @@ def main():
 
     optimizer = build_optimizer(model, args.decoder_lr, args.image_lr, args.text_lr, args.weight_decay)
     total_steps = args.epochs * max(len(train_loader), 1)
-    warmup_steps = WARMUP_EPOCHS * max(len(train_loader), 1)
-    scheduler = build_scheduler(optimizer, total_steps, warmup_steps, MIN_LR_RATIO) if total_steps > 0 else None
+    warmup_steps = args.warmup_epochs * max(len(train_loader), 1)
+    scheduler = build_scheduler(optimizer, total_steps, warmup_steps, args.min_lr_ratio) if total_steps > 0 else None
     scaler = GradScaler(enabled=args.amp and device.type == "cuda")
     criterion_dice = DiceLoss()
     criterion_focal = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
 
     save_json(run_dir / "config_used.json", {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
     history = defaultdict(list)
-    best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0}
+    best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0}
     start_epoch = 1
     if resume_checkpoint_path is not None:
         start_epoch, history, best_metrics, _ = resume_training_state(
@@ -867,6 +970,7 @@ def main():
             current_all11 = val_metrics.get("iou/overall", 0.0)
             current_old5 = val_metrics.get("iou/old5", 0.0)
             current_rare = val_metrics.get("iou/rare", 0.0)
+            current_pos_only = val_metrics.get("iou/pos_only", 0.0)
             if current_all11 > best_metrics["best_all11"]:
                 best_metrics["best_all11"] = current_all11
                 save_checkpoint(run_dir / "best_all11.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
@@ -876,9 +980,15 @@ def main():
             if current_rare > best_metrics["best_rare"]:
                 best_metrics["best_rare"] = current_rare
                 save_checkpoint(run_dir / "best_rare.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
+            if current_pos_only > best_metrics["best_pos_only"]:
+                best_metrics["best_pos_only"] = current_pos_only
+                save_checkpoint(run_dir / "best_pos_only.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
 
     if last_epoch > 0:
-        save_checkpoint(run_dir / "final_fullset.pt", last_epoch, model, optimizer, scheduler, history, best_metrics, args)
+        final_name = "final_fullset.pt" if args.no_val else "final_split.pt"
+        final_path = run_dir / final_name
+        save_checkpoint(final_path, last_epoch, model, optimizer, scheduler, history, best_metrics, args)
+        LOGGER.info("训练结束，已保存最终 checkpoint: %s", final_path)
 
     if args.train_eval_after:
         LOGGER.info("开始训练集诊断评估。注意：这个指标只是伪标签拟合诊断，不是真实验证分数。")
@@ -889,13 +999,18 @@ def main():
             image_root=args.image_root,
             img_size=(args.img_size, args.img_size),
             classes=CLASSES,
-            prompt_prototypes=PROMPT_PROTOTYPES,
+            prompt_prototypes=args.prompt_prototype_cfg,
             augment_prompt=False,
             hflip_prob=0.0,
             use_conf_filter=False,
             negative_sample_prob=0.0,
-            negative_sample_weight=NEGATIVE_SAMPLE_WEIGHT,
+            negative_sample_weight=args.negative_sample_weight,
             rare_oversample=None,
+            old_class_sample_ratio=1.0,
+            rare_class_keep_ratio=1.0,
+            old_classes=args.old_classes,
+            rare_classes=args.rare_classes,
+            rare_balance_enabled=False,
             training=False,
             seed=args.train_eval_seed,
         )

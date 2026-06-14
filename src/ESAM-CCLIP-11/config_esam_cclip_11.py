@@ -29,6 +29,8 @@ CLASS_TO_IDX = {name: idx for idx, name in enumerate(CLASSES)}
 IDX_TO_CLASS = {idx: name for idx, name in enumerate(CLASSES)}
 OLD5_CLASSES = ["person", "car", "building", "tree", "animal"]
 RARE_CLASSES = ["trash can", "door", "fence", "motorcycle", "window", "pole_light"]
+RARE_BALANCED_OLD_CLASSES = list(OLD5_CLASSES)
+RARE_BALANCED_RARE_CLASSES = list(RARE_CLASSES)
 
 PROMPT_THRESHOLDS = {
     "person": 0.65,
@@ -145,6 +147,8 @@ NEGATIVE_SAMPLE_RATIO = 0.02
 NEGATIVE_SAMPLE_WEIGHT = 0.20
 INCLUDE_NEGATIVE_SAMPLES = True
 VAL_INCLUDE_NEGATIVE_SAMPLES = False
+OLD_CLASS_SAMPLE_RATIO = 1.0
+RARE_CLASS_KEEP_RATIO = 1.0
 RARE_OVERSAMPLE = {
     "trash can": 2,
     "fence": 2,
@@ -174,3 +178,119 @@ POSTPROCESS_DEFAULT = {
     "pole_light": {"min_area": 1, "fill_holes": False},
     "motorcycle": {"min_area": 4, "fill_holes": False},
 }
+
+
+PRESET_CHOICES = (
+    "base",
+    "lite_fullset_polish",
+    "split_bridge_stage1",
+    "split_bridge_stage2_fullset",
+    "rare_repair_lite",
+)
+
+RARE_REPAIR_LITE_OVERSAMPLE = {
+    "trash can": 3,
+    "window": 2,
+    "door": 2,
+    "fence": 3,
+    "pole_light": 3,
+    "motorcycle": 2,
+}
+
+PRESET_CONFIGS = {
+    "base": {},
+    "lite_fullset_polish": {
+        "run_name": "ESAM-CCLIP-11-lite-fullset-polish",
+        "no_val": True,
+        "no_train_split_filter": True,
+        "epochs": 3,
+        "decoder_lr": 5e-5,
+        "warmup_epochs": 1,
+        "negative_sample_ratio": 0.01,
+        "negative_sample_weight": 0.10,
+        "rare_balance_enabled": False,
+        "old_class_sample_ratio": 1.0,
+        "rare_class_keep_ratio": 1.0,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_lite_polish.pt",
+        "rare_oversample": dict(RARE_OVERSAMPLE),
+    },
+    "split_bridge_stage1": {
+        "run_name": "ESAM-CCLIP-11-split-bridge-stage1",
+        "train_json": TRAIN_JSON,
+        "val_json": VAL_JSON,
+        "train_list": TRAIN_LIST,
+        "val_list": VAL_LIST,
+        "no_val": False,
+        "no_train_split_filter": False,
+        "epochs": 3,
+        "decoder_lr": 5e-5,
+        "warmup_epochs": 1,
+        "negative_sample_ratio": 0.02,
+        "negative_sample_weight": 0.15,
+        "rare_balance_enabled": False,
+        "old_class_sample_ratio": 1.0,
+        "rare_class_keep_ratio": 1.0,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_split_bridge.pt",
+        "rare_oversample": dict(RARE_OVERSAMPLE),
+    },
+    "split_bridge_stage2_fullset": {
+        "run_name": "ESAM-CCLIP-11-split-bridge-fullset",
+        "train_json": ALL_JSON,
+        "no_val": True,
+        "no_train_split_filter": True,
+        "epochs": 3,
+        "decoder_lr": 3e-5,
+        "warmup_epochs": 1,
+        "negative_sample_ratio": 0.01,
+        "negative_sample_weight": 0.10,
+        "rare_balance_enabled": False,
+        "old_class_sample_ratio": 1.0,
+        "rare_class_keep_ratio": 1.0,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_split_bridge.pt",
+        "rare_oversample": dict(RARE_OVERSAMPLE),
+    },
+    "rare_repair_lite": {
+        "run_name": "ESAM-CCLIP-11-rare-repair-lite",
+        "no_val": False,
+        "no_train_split_filter": False,
+        "epochs": 3,
+        "decoder_lr": 5e-5,
+        "warmup_epochs": 1,
+        "negative_sample_ratio": 0.01,
+        "negative_sample_weight": 0.10,
+        "rare_balance_enabled": True,
+        "old_class_sample_ratio": 0.80,
+        "rare_class_keep_ratio": 1.0,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_rare_repair_lite.pt",
+        "rare_oversample": dict(RARE_REPAIR_LITE_OVERSAMPLE),
+    },
+}
+
+
+def _clone_preset_value(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, list):
+        return list(value)
+    return value
+
+
+def apply_preset(args, explicit_dests=None):
+    explicit_dests = set(explicit_dests or [])
+    preset_name = getattr(args, "preset", "base")
+    preset_cfg = PRESET_CONFIGS.get(preset_name, {})
+    for key, value in preset_cfg.items():
+        if key not in explicit_dests:
+            setattr(args, key, _clone_preset_value(value))
+
+    if not hasattr(args, "rare_balance_enabled"):
+        args.rare_balance_enabled = False
+    if not hasattr(args, "rare_oversample") or args.rare_oversample is None:
+        args.rare_oversample = dict(RARE_OVERSAMPLE)
+    else:
+        args.rare_oversample = dict(args.rare_oversample)
+
+    args.class_weights = dict(CLASS_WEIGHTS)
+    args.old_classes = list(RARE_BALANCED_OLD_CLASSES)
+    args.rare_classes = list(RARE_BALANCED_RARE_CLASSES)
+    return args
