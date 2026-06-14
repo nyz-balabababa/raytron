@@ -1,0 +1,205 @@
+================================================================================
+clipseg-v4 摘要
+================================================================================
+
+当前 `clipseg-v4` 的主线是：
+
+1. 先训练 `B0-hard` 基线
+2. 再生成 `CLIPSeg` teacher soft cache
+3. 最后从 hard 权重继续做 `B0+D` 蒸馏
+
+`computer` 类已从 v4 训练链路中移除。
+
+本文件作为 `clipseg-v4` 的运行脚本说明书使用，集中放运行顺序、命令示例和各脚本用途。
+
+================================================================================
+脚本说明
+================================================================================
+
+`config_clipseg.py`
+  这个脚本集中维护训练、验证、teacher、路径和超参数配置。平时改类别、数据源、模型默认目录、蒸馏默认权重，优先改这里，不要在训练脚本里硬改常量。
+
+`clipseg_train.py`
+  这是主训练脚本，负责跑 `B0-hard` 和 `B0+D` 两种模式。它会读取配置、组织训练样本、执行续训逻辑，并输出 `last.pt`、`best_all11.pt`、`best_old5.pt`、`best_rare.pt`。
+
+`cache_clipseg_soft_masks.py`
+  这是 teacher soft mask 的缓存脚本，给蒸馏训练提前生成 `.npy` 概率图。它会按训练同款红外预处理和 `768 x 768` 画布对齐，把结果保存到 `clipseg_soft_cache_11`。
+
+`clipseg_infer_eval.py`
+  这是本地推理评估脚本，用来验证某个训练好的 checkpoint 推理输出是否正常。它不参与训练，只负责加载模型、跑预测并导出结果。
+
+`TECHNICAL_DOC.md`
+  这个文档只保留方案、流程和技术机制说明，不再放运行命令。要看为什么这么设计、B0-hard 和 B0+D 的关系、teacher cache 如何对齐，读这个文件。
+
+================================================================================
+运行前检查
+================================================================================
+
+不要把解释器路径写死。换电脑后，先进入项目目录并激活环境：
+
+```powershell
+cd D:\nyz\raytron_project
+conda activate rayton
+python -c "import sys; print(sys.executable)"
+```
+
+如果目标电脑不用 `conda`，只要保证当前终端里的 `python` 指向正确环境即可。
+
+建议先确认：
+
+```powershell
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+python -c "import transformers, cv2, numpy, matplotlib, tqdm; print('deps_ok')"
+```
+
+如果要生成或读取 COCO RLE，最好再确认：
+
+```powershell
+python -c "import pycocotools; print('pycocotools_ok')"
+```
+
+================================================================================
+推荐运行顺序
+================================================================================
+
+1. 先跑一个 `B0-hard`
+2. 再生成 teacher soft cache
+3. 最后从 hard 权重启动 `B0+D`
+
+================================================================================
+B0-hard 训练
+================================================================================
+
+新开一个不自动续训的 hard run：
+
+```powershell
+python src\train\clipseg-v4\clipseg_train.py `
+  --run_name segformer_b0_hard_v1 `
+  --epochs 5 `
+  --no_auto_resume
+```
+
+如果中断后继续同一个 run：
+
+```powershell
+python src\train\clipseg-v4\clipseg_train.py `
+  --run_name segformer_b0_hard_v1 `
+  --epochs 5
+```
+
+说明：
+
+- 会优先找 `test\train_output\segformer_b0_hard_v1\last.pt`
+- 不加 `--resume_weights_only` 时，会恢复 optimizer 和 scheduler
+
+================================================================================
+Teacher Cache
+================================================================================
+
+按默认配置生成 teacher soft cache：
+
+```powershell
+python src\train\clipseg-v4\cache_clipseg_soft_masks.py `
+  --output_dir test\train_output\clipseg_soft_cache_11 `
+  --overwrite
+```
+
+如果要显式指定 teacher base model 和 checkpoint：
+
+```powershell
+python src\train\clipseg-v4\cache_clipseg_soft_masks.py `
+  --output_dir test\train_output\clipseg_soft_cache_11 `
+  --base_model_dir model\clipseg-rd64-refined `
+  --teacher_checkpoint test\train_output\clipseg_xiyou_12cls_trainval_v1\best.pt `
+  --overwrite
+```
+
+生成后重点看：
+
+- `test\train_output\clipseg_soft_cache_11\cache_summary.json`
+- 是否生成大量 `{ann_id}__{class_name}.npy`
+- `failed_items.json` 是否为空或只有少量失败项
+
+================================================================================
+B0+D 蒸馏
+================================================================================
+
+从 hard 权重启动一个新的蒸馏 run：
+
+```powershell
+python src\train\clipseg-v4\clipseg_train.py `
+  --use_distill `
+  --run_name segformer_b0_distill_v1 `
+  --epochs 10 `
+  --resume test\train_output\segformer_b0_hard_v1\best_all11.pt `
+  --resume_weights_only `
+  --reset_history `
+  --teacher_soft_cache test\train_output\clipseg_soft_cache_11 `
+  --distill_lambda 0.15 `
+  --distill_lambda_rare 0.25 `
+  --distill_start_epoch 0 `
+  --no_auto_resume
+```
+
+说明：
+
+- `--resume_weights_only` 只继承模型参数，不继承 optimizer/scheduler
+- `--reset_history` 会清空 epoch 和 best 指标，作为新的蒸馏实验开始
+- 第一轮日志要重点看 `Teacher cache hit_rate`
+
+如果只是继续同一个蒸馏 run：
+
+```powershell
+python src\train\clipseg-v4\clipseg_train.py `
+  --use_distill `
+  --run_name segformer_b0_distill_v1 `
+  --epochs 10 `
+  --teacher_soft_cache test\train_output\clipseg_soft_cache_11
+```
+
+================================================================================
+本地推理评估
+================================================================================
+
+```powershell
+python src\train\clipseg-v4\clipseg_infer_eval.py `
+  --model test\train_output\segformer_b0_hard_v1\best_all11.pt `
+  --test_tasks test\test_tasks.json `
+  --output test\train_output\predictions.json
+```
+
+================================================================================
+输出位置
+================================================================================
+
+训练输出：
+
+`test\train_output\<run_name>\`
+
+teacher cache：
+
+`test\train_output\clipseg_soft_cache_11\`
+
+关键文件：
+
+- `best_all11.pt`
+- `best_old5.pt`
+- `best_rare.pt`
+- `last.pt`
+- `results.csv`
+- `results.png`
+- `cache_summary.json`
+- `failed_items.json`
+
+================================================================================
+关键修复
+================================================================================
+
+P0#1  `--resume / --run_name / --epochs` 已真正生效
+P0#2  验证集不再混入负样本
+P0#3  `FOCAL_ALPHA` 已真正参与 focal loss
+P0#4  teacher cache 命名与训练读取规则已统一
+P0#5  teacher checkpoint 改为 `base_model_dir + checkpoint` 正确加载
+P0#6  teacher soft mask 与学生训练画布统一为 `768 x 768`
+P0#7  蒸馏训练会打印 teacher cache 命中率
+P0#8  checkpoint 已额外保存 classes / img_size / thresholds / model_type

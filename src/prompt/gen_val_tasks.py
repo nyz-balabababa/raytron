@@ -25,10 +25,12 @@ from typing import Iterable, List
 ROOT = Path(__file__).resolve().parents[2]
 
 # ── 用户配置区：平时直接改这里 ──────────────────────────────────────────
-TASK_IMAGE_LIST = ROOT / "test" / "val_list.txt"
-TASK_OUTPUT_JSON = ROOT / "test" / "json" / "val_tasks1.json"
+TASK_IMAGE_LIST = ROOT / "test" / "train_list.txt"
+TASK_OUTPUT_JSON = ROOT / "test" / "json" / "train_motorcycle.json"
 TASK_IMAGE_ROOT = ROOT
-TASK_PROMPTS = ["person", "car", "building", "tree", "animal"]
+TASK_PROMPTS = [
+    "motorcycle"
+]
 TASK_SKIP_LIST = ROOT / "noisy_data" / "unified_denylist.txt"
 TASK_ALLOW_MISSING = False
 TASK_ANN_ID_START = 1

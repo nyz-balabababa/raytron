@@ -3,7 +3,12 @@ model/
 sam3/
 assets/
 src/hanxue/weights/
-src/zmq/
+src/zmq-DINO
+src/DINO/models
+src/DINO/groundingdino
+src/DINO/efficient_sam
+# ── 提交打包目录（不进 git）──
+to_Df*/
 
 # ── 训练数据（5万+图片，太大）──
 test/data1/
@@ -12,6 +17,11 @@ test/data4/
 test/data5/
 test/data6/
 test/data7/
+test/clean_rare
+test/sam3_label_new
+test/cache/
+test/json/
+test/trainval_list.txt
 
 # ── 生成的伪标签 & 训练输出（体积大，可重新生成）──
 test/prompt_test_output/
@@ -26,6 +36,7 @@ test/inference_eval/
 test/label_analysis/
 test/sam3_label_output/
 test/sam3_label_old/
+
 
 # ── test 下其他生成文件 ──
 test/txt/

@@ -31,32 +31,65 @@ from PIL import Image
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OFFICIAL_ROOT = Path(r"D:\nyz\sam3\选手示例工程\to_Df - 官方")
-DEFAULT_TASKS = ROOT / "test" / "json" / "train_tasks.json"
+DEFAULT_SAM3_ROOT = ROOT
+DEFAULT_TASKS = ROOT / "test" / "json" / "train_animal.json"
 DEFAULT_IMAGE_ROOT = ROOT
-DEFAULT_OUTPUT_ROOT = ROOT / "test" / "prompt_test_output"
-DEFAULT_CHECKPOINT = DEFAULT_OFFICIAL_ROOT / "model" / "sam3.pt"
-DEFAULT_PROMPT_THRESHOLD = 0.60
-DEFAULT_PROCESSOR_CONF_THRESHOLD = 0.50
+DEFAULT_OUTPUT_ROOT = ROOT / "test" / "label_analysis" / "animal_out" / "train_animal"
+DEFAULT_CHECKPOINT = ROOT / "model" / "sam3.pt"
+DEFAULT_PROMPT_THRESHOLD = 0.45
+DEFAULT_PROCESSOR_CONF_THRESHOLD = 0.35
 DEFAULT_RAW_STATS_THRESHOLD = 0.01
 DEFAULT_SKIP_LIST = ROOT / "noisy_data" / "unified_denylist.txt"
 DEFAULT_OUTPUT_THRESHOLDS = {
-    "person": 0.70,
-    "car": 0.70,
-    "building": 0.70,
-    "tree": 0.60,
-    "animal": 0.60,
+    # 小目标 / 容易漏检，先稍微低一点
+    "rabbit": 0.55,
+    "monkey": 0.55,
+
+    # 中大型动物，语义比较明确
+    "horse": 0.58,
+    "pig": 0.58,
+    "lion": 0.55,
+    "tiger": 0.58,
+    "bear": 0.58,
+    "wolf": 0.56,
+    "fox": 0.56,
+    "dog": 0.56,
+
+    # 外观特征明显，但样本可能少
+    "zebra": 0.55,
+    "giraffe": 0.55,
+
+    # 很容易爆碎片，必须高一点
+    "duck": 0.68,
 }
+
+MAX_INSTANCES_PER_IMAGE = {
+    "rabbit": 3,
+    "horse": 3,
+    "pig": 3,
+    "zebra": 3,
+    "duck": 2,
+    "lion": 3,
+    "tiger": 3,
+    "monkey": 3,
+    "giraffe": 3,
+    "bear": 3,
+    "wolf": 3,
+    "fox": 3,
+    "dog": 3,
+}
+
+DEFAULT_MAX_INSTANCES = 3
 
 # 预处理参数，沿用 prompt_test 的经验值
 PSEUDO_COLOR_SAT_THRESH = 60.0
 BLACKHOT_SKEW_THRESH = -0.3
 STD_LOW = 35.0
 STD_MID = 50.0
-NOISE_HIGH = 12.0
+NOISE_HIGH = 14.0
 NOISE_MED = 8.0
-BLUR_LOW = 150.0
-BLUR_MID = 300.0
+BLUR_LOW = 120.0
+BLUR_MID = 280.0
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -127,10 +160,15 @@ def normalize_mask(mask_tensor: torch.Tensor) -> np.ndarray:
 
 
 def aggregate_prompt_prediction(
-    state: Dict[str, Any], prompt: str, conf_threshold: float
+    state: Dict[str, Any],
+    prompt: str,
+    conf_threshold: float,
+    max_instances: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     直接改写自官方 inference.py 的聚合逻辑。
+
+    max_instances: 非 None 时，只保留分数最高的 top-k 个 mask 进行合并。
     """
     masks = state.get("masks")
     scores = state.get("scores")
@@ -149,6 +187,17 @@ def aggregate_prompt_prediction(
     if not selected_indices:
         return None
 
+    # 按分数从高到低排序
+    selected_indices = sorted(
+        selected_indices,
+        key=lambda idx: float(scores_np[idx]),
+        reverse=True,
+    )
+
+    # top-k 截断
+    if max_instances is not None:
+        selected_indices = selected_indices[:max_instances]
+
     merged_mask: Optional[np.ndarray] = None
     for index in selected_indices:
         mask_np = normalize_mask(masks[index])
@@ -165,6 +214,8 @@ def aggregate_prompt_prediction(
         "score": float(np.max(scores_np[selected_indices])) if len(scores_np) > 0 else 0.0,
         "instance_count": len(selected_indices),
         "rle": mask_to_rle(merged_mask),
+        "selected_indices": [int(i) for i in selected_indices],
+        "selected_scores": [float(scores_np[i]) for i in selected_indices],
     }
 
 
@@ -278,12 +329,29 @@ def load_threshold_overrides(raw_json: Optional[str]) -> Dict[str, float]:
     return {str(k): float(v) for k, v in parsed.items()}
 
 
+def get_max_instances(prompt: str, overrides: Dict[str, int], default_max: int) -> Optional[int]:
+    value = overrides.get(prompt, default_max)
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        return None
+    return value
+
+
+def load_max_instances_overrides(raw_json: Optional[str]) -> Dict[str, int]:
+    if not raw_json:
+        return dict(MAX_INSTANCES_PER_IMAGE)
+    parsed = json.loads(raw_json)
+    return {str(k): int(v) for k, v in parsed.items()}
+
+
 def load_model(
-    official_root: Path,
+    sam3_root: Path,
     checkpoint_path: Path,
     processor_conf_threshold: float,
 ):
-    build_sam3_image_model, Sam3Processor = import_official_sam3(official_root)
+    build_sam3_image_model, Sam3Processor = import_official_sam3(sam3_root)
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"模型权重不存在: {checkpoint_path}")
@@ -305,6 +373,8 @@ def infer_prompts_for_image(
     raw_stats_threshold: float,
     default_threshold: float,
     threshold_overrides: Dict[str, float],
+    max_instances_overrides: Dict[str, int],
+    default_max_instances: int,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     state = processor.set_image(image)
     raw_results: Dict[str, Dict[str, Any]] = {}
@@ -314,12 +384,29 @@ def infer_prompts_for_image(
         processor.reset_all_prompts(state)
         state = processor.set_text_prompt(prompt=prompt, state=state)
 
-        raw_prediction = aggregate_prompt_prediction(state, prompt, raw_stats_threshold)
+        # raw_stats 不限制 top-k，观察原始激活数量
+        raw_prediction = aggregate_prompt_prediction(
+            state=state,
+            prompt=prompt,
+            conf_threshold=raw_stats_threshold,
+            max_instances=None,
+        )
         if raw_prediction is not None:
             raw_results[prompt] = raw_prediction
 
+        # filtered 输出限制 top-k
         output_threshold = get_output_threshold(prompt, default_threshold, threshold_overrides)
-        filtered_prediction = aggregate_prompt_prediction(state, prompt, output_threshold)
+        max_instances = get_max_instances(
+            prompt,
+            max_instances_overrides,
+            default_max_instances,
+        )
+        filtered_prediction = aggregate_prompt_prediction(
+            state=state,
+            prompt=prompt,
+            conf_threshold=output_threshold,
+            max_instances=max_instances,
+        )
         if filtered_prediction is not None:
             filtered_results[prompt] = filtered_prediction
 
@@ -402,10 +489,11 @@ def run_tasks(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     threshold_overrides = load_threshold_overrides(args.output_thresholds_json)
+    max_instances_overrides = load_max_instances_overrides(args.max_instances_json)
     skip_set = load_skip_set(args.skip_list)
 
     _, processor = load_model(
-        official_root=args.official_root,
+        sam3_root=args.sam3_root,
         checkpoint_path=args.checkpoint,
         processor_conf_threshold=args.processor_conf_threshold,
     )
@@ -449,6 +537,8 @@ def run_tasks(args: argparse.Namespace) -> None:
                 raw_stats_threshold=args.raw_stats_threshold,
                 default_threshold=args.default_threshold,
                 threshold_overrides=threshold_overrides,
+                max_instances_overrides=max_instances_overrides,
+                default_max_instances=args.default_max_instances,
             )
         except Exception as exc:
             skipped_images.append({"image_path": rel_path, "reason": f"inference_error: {exc}"})
@@ -495,6 +585,7 @@ def run_tasks(args: argparse.Namespace) -> None:
                     "score": round(pred["score"], 4),
                     "instances": pred.get("instance_count", 0),
                     "rle": pred.get("rle"),
+                    "selected_scores": [round(float(x), 4) for x in pred.get("selected_scores", [])],
                 }
             else:
                 pred_entry["prompts"][prompt] = {"hit": False}
@@ -536,7 +627,7 @@ def run_tasks(args: argparse.Namespace) -> None:
             {
                 "tasks": str(args.tasks),
                 "image_root": str(args.image_root),
-                "official_root": str(args.official_root),
+                "sam3_root": str(args.sam3_root),
                 "checkpoint": str(args.checkpoint),
                 "device": DEVICE,
                 "enable_preprocess": bool(args.enable_preprocess),
@@ -544,6 +635,8 @@ def run_tasks(args: argparse.Namespace) -> None:
                 "raw_stats_threshold": float(args.raw_stats_threshold),
                 "default_threshold": float(args.default_threshold),
                 "output_threshold_overrides": threshold_overrides,
+                "max_instances_overrides": max_instances_overrides,
+                "default_max_instances": int(args.default_max_instances),
                 "skip_list": str(args.skip_list) if args.skip_list else None,
                 "kept_images": len(kept_images),
                 "skipped_images": len(skipped_images),
@@ -568,17 +661,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-root", type=Path, default=DEFAULT_IMAGE_ROOT, help="图片根目录")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="输出根目录")
     parser.add_argument(
-        "--official-root",
+        "--sam3-root",
         type=Path,
-        default=DEFAULT_OFFICIAL_ROOT,
-        help="官方 to_Df - 官方 根目录",
+        default=DEFAULT_SAM3_ROOT,
+        help="SAM3 代码包所在根目录（默认项目根，其下有 sam3/ 包）",
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT, help="SAM3 权重路径")
     parser.add_argument(
         "--processor-conf-threshold",
         type=float,
         default=DEFAULT_PROCESSOR_CONF_THRESHOLD,
-        help="Sam3Processor 内部 proposal 保留阈值，默认沿用官方 0.5",
+        help="Sam3Processor 内部 proposal 保留阈值，当前默认 0.35，用于长尾探索保留更多候选",
     )
     parser.add_argument(
         "--raw-stats-threshold",
@@ -597,6 +690,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help='按类阈值 JSON 字符串，如 {"person":0.7,"trash can":0.65}',
+    )
+    parser.add_argument(
+        "--max-instances-json",
+        type=str,
+        default=None,
+        help='按 prompt 设置每张图最多保留实例数，如 {"duck":2,"rabbit":3}；<=0 表示不限制',
+    )
+    parser.add_argument(
+        "--default-max-instances",
+        type=int,
+        default=DEFAULT_MAX_INSTANCES,
+        help="未单独配置 prompt 时，每张图每个 prompt 最多保留多少个实例；<=0 表示不限制",
     )
     parser.add_argument(
         "--skip-list",

@@ -1,160 +1,218 @@
 #!/usr/bin/env python3
 """
-CLIPSeg 模型导出 —— 打包为 Docker 提交所需的 /raytron/code/model/ 目录
+提交模型导出脚本。
 
-用法:
-    python src/export_model.py
+支持两条提交路线：
+1. `clipseg_v2`
+2. `clipseg_xiyou_12cls_trainval_v1`
+2. `efficientsam_easy_6cls_v1`
 
-输入:
-    test/train_output/clipseg_v1/best.pt    ← CLIPSeg 训练好的 checkpoint
-    model/clipseg-rd64-refined/             ← HuggingFace base 模型 (config + tokenizer)
-
-输出:
-    model/submit/                           ← Docker 构建用，包含:
-        ├── config.json                     ← HuggingFace 配置
-        ├── preprocessor_config.json
-        ├── tokenizer.json / vocab.json / merges.txt  ← CLIP tokenizer
-        ├── special_tokens_map.json / tokenizer_config.json
-        └── sam3.pt                         ← 训练好的 CLIPSeg state_dict (FP32)
+用法：
+    python src/export_model.py --preset efficientsam_easy_6cls_v1
+    python src/export_model.py --preset clipseg_v2
+    python src/export_model.py --preset clipseg_xiyou_12cls_trainval_v1
 """
-import json
+
+from __future__ import annotations
+
+import argparse
 import logging
 import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Any, Dict
 
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── 路径配置 ──
 ROOT = Path(__file__).resolve().parent.parent
-BASE_MODEL_DIR = ROOT / "model" / "clipseg-rd64-refined"   # HuggingFace base 模型
-TRAINED_CKPT = ROOT / "test" / "train_output" / "clipseg_v2" / "best.pt"   # 训练好的权重
-OUTPUT_DIR = ROOT / "model" / "submit-clipseg-v2"                      # 输出目录
 HF_CACHE_DIR = ROOT / "test" / ".hf_cache"
 
-# ══════════════════════════════════════════════════════════════════════
-# HuggingFace 必须文件列表（tokenizer + config）
-# ══════════════════════════════════════════════════════════════════════
+PRESETS: Dict[str, Dict[str, Any]] = {
+    "clipseg_v2": {
+        "model_family": "clipseg",
+        "base_model_dir": ROOT / "model" / "clipseg-rd64-refined",
+        "checkpoint_path": ROOT / "test" / "train_output" / "clipseg_v2" / "best.pt",
+        "output_dir": ROOT / "model" / "submit-clipseg-v2",
+        "required_files": [
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "special_tokens_map.json",
+        ],
+    },
+    "clipseg_xiyou_12cls_trainval_v1": {
+        "model_family": "clipseg",
+        "base_model_dir": ROOT / "model" / "clipseg-rd64-refined",
+        "checkpoint_path": ROOT / "test" / "train_output" / "clipseg_xiyou_12cls_trainval_v1" / "best.pt",
+        "output_dir": ROOT / "model" / "submit-clipseg-xiyou-12cls-trainval-v1",
+        "required_files": [
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "special_tokens_map.json",
+        ],
+    },
+    "efficientsam_easy_6cls_v1": {
+        "model_family": "esam_chineseclip",
+        "base_model_dir": ROOT / "src" / "hanxue" / "weights" / "chinese_clip",
+        "checkpoint_path": ROOT / "test" / "train_output" / "efficientsam_easy_6cls_v1" / "efficientsam_easy_6cls_v1" / "best.pt",
+        "output_dir": ROOT / "model" / "submit-efficientsam-easy-6cls-v1",
+        "required_files": [
+            "config.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.txt",
+        ],
+        "optional_files": [
+            "preprocessor_config.json",
+        ],
+    },
+}
 
-REQUIRED_FILES = [
-    "config.json",
-    "preprocessor_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "vocab.json",
-    "merges.txt",
-    "special_tokens_map.json",
-]
 
-
-def ensure_hf_cache():
-    """Use a repo-local HuggingFace cache to avoid user-profile permission issues."""
+def ensure_hf_cache() -> None:
     HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE_DIR / "hub"))
     os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR / "transformers"))
 
 
-def check_model_param_count(checkpoint_path: Path) -> int:
-    """加载 checkpoint 并核实参数量 ≤ 300M。"""
+def extract_state_dict(checkpoint: Any) -> Dict[str, torch.Tensor]:
+    if isinstance(checkpoint, dict):
+        for key in ["model_state_dict", "state_dict", "model", "net"]:
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                return checkpoint[key]
+        if all(isinstance(k, str) for k in checkpoint.keys()):
+            tensor_like = [torch.is_tensor(v) for v in checkpoint.values()]
+            if tensor_like and any(tensor_like):
+                return checkpoint
+    raise RuntimeError("无法从 checkpoint 中提取 state_dict。")
+
+
+def copy_files(src_dir: Path, output_dir: Path, required_files, optional_files=()) -> None:
+    logger.info(f"从 {src_dir} 复制提交所需文件...")
+    for fname in required_files:
+        src = src_dir / fname
+        dst = output_dir / fname
+        if not src.exists():
+            raise FileNotFoundError(f"缺少必需文件: {src}")
+        shutil.copy2(src, dst)
+        logger.info(f"  ✅ {fname}")
+
+    for fname in optional_files:
+        src = src_dir / fname
+        dst = output_dir / fname
+        if src.exists():
+            shutil.copy2(src, dst)
+            logger.info(f"  ✅ {fname} (optional)")
+
+
+def count_clipseg_params(base_model_dir: Path, checkpoint_path: Path) -> int:
     from transformers import CLIPSegForImageSegmentation
 
-    logger.info(f"检查参数量: {checkpoint_path}")
-    model = CLIPSegForImageSegmentation.from_pretrained(str(BASE_MODEL_DIR))
-
+    logger.info(f"检查 CLIPSeg 参数量: {checkpoint_path}")
+    model = CLIPSegForImageSegmentation.from_pretrained(str(base_model_dir))
     if checkpoint_path.exists():
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        elif "model" in ckpt:
-            state_dict = ckpt["model"]
-        else:
-            state_dict = ckpt
+        state_dict = extract_state_dict(ckpt)
         model.load_state_dict(state_dict, strict=False)
-
-    total = sum(p.numel() for p in model.parameters())
+    total = sum(param.numel() for param in model.parameters())
     logger.info(f"  总参数量: {total:,}")
+    logger.info(f"  300M 限制: {'✅ 通过' if total < 300_000_000 else '❌ 超标!'}")
+    return int(total)
+
+
+def count_state_dict_params(state_dict: Dict[str, torch.Tensor]) -> int:
+    ignore_suffixes = ("running_mean", "running_var", "num_batches_tracked")
+    total = 0
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            continue
+        if key.endswith(ignore_suffixes):
+            continue
+        total += int(value.numel())
+    logger.info(f"  近似参数量(按 state_dict 统计): {total:,}")
     logger.info(f"  300M 限制: {'✅ 通过' if total < 300_000_000 else '❌ 超标!'}")
     return total
 
 
-def export(checkpoint_path: Path = TRAINED_CKPT, output_dir: Path = OUTPUT_DIR):
-    """
-    1. 复制 HuggingFace 配置文件到输出目录
-    2. 从训练 checkpoint 提取 state_dict 保存为 sam3.pt
-    3. 验证参数量 ≤ 300M
-    """
+def export(preset_name: str) -> None:
+    if preset_name not in PRESETS:
+        raise KeyError(f"未知 preset: {preset_name}，可选: {sorted(PRESETS)}")
+
+    preset = PRESETS[preset_name]
+    base_model_dir = Path(preset["base_model_dir"])
+    checkpoint_path = Path(preset["checkpoint_path"])
+    output_dir = Path(preset["output_dir"])
+    required_files = list(preset.get("required_files", []))
+    optional_files = list(preset.get("optional_files", []))
+
+    if not base_model_dir.exists():
+        raise FileNotFoundError(f"Base 模型目录不存在: {base_model_dir}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
+    copy_files(base_model_dir, output_dir, required_files, optional_files)
 
-    # ── 步骤 1: 复制 HuggingFace 配置文件 ──
-    logger.info(f"从 {BASE_MODEL_DIR} 复制配置文件...")
-    for fname in REQUIRED_FILES:
-        src = BASE_MODEL_DIR / fname
-        dst = output_dir / fname
-        if src.exists():
-            shutil.copy2(src, dst)
-            logger.info(f"  ✅ {fname}")
-        else:
-            logger.warning(f"  ⚠️  {fname} 缺失")
-
-    # ── 步骤 2: 处理训练权重 ──
     if checkpoint_path.exists():
         logger.info(f"导出训练权重: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-        # 提取 state_dict（兼容多种保存格式）
-        if "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-            logger.info("  格式: {'model_state_dict': ...}")
-        elif "model" in ckpt:
-            state_dict = ckpt["model"]
-            logger.info("  格式: {'model': ...}")
-        else:
-            state_dict = ckpt
-            logger.info("  格式: 裸 state_dict")
-
-        # 保存为 sam3.pt (FP32)
+        state_dict = extract_state_dict(ckpt)
         sam3_path = output_dir / "sam3.pt"
         torch.save(state_dict, sam3_path)
         size_mb = sam3_path.stat().st_size / 1024**2
-        logger.info(f"  已保存: {sam3_path} ({size_mb:.0f} MB)")
+        logger.info(f"  已保存: {sam3_path} ({size_mb:.1f} MB)")
     else:
-        logger.warning(f"⚠️  训练权重不存在: {checkpoint_path}")
-        logger.warning("  将使用 HuggingFace 原始 pytorch_model.bin 作为替代")
-        src = BASE_MODEL_DIR / "pytorch_model.bin"
-        if src.exists():
-            dst = output_dir / "sam3.pt"
-            shutil.copy2(src, dst)
-            size_mb = dst.stat().st_size / 1024**2
-            logger.info(f"  已复制: {dst} ({size_mb:.0f} MB)")
+        raise FileNotFoundError(f"训练权重不存在: {checkpoint_path}")
 
-    # ── 步骤 3: 验证参数量 ──
     logger.info("")
-    total_params = check_model_param_count(checkpoint_path)
+    if preset["model_family"] == "clipseg":
+        total_params = count_clipseg_params(base_model_dir, checkpoint_path)
+    else:
+        total_params = count_state_dict_params(state_dict)
 
-    # ── 输出清单 ──
     logger.info(f"\n{'=' * 50}")
     logger.info(f"导出完成: {output_dir}")
-    for f in sorted(output_dir.iterdir()):
-        size = f.stat().st_size / 1024**2
-        logger.info(f"  {f.name:30s} {size:8.1f} MB")
+    logger.info(f"preset: {preset_name}")
+    for file_path in sorted(output_dir.iterdir()):
+        size_mb = file_path.stat().st_size / 1024**2
+        logger.info(f"  {file_path.name:30s} {size_mb:8.1f} MB")
     logger.info(f"{'─' * 50}")
-    logger.info(f"总参数量: {total_params:,}")
-    logger.info(f"下一步: docker build -t raytron-submit .")
+    logger.info(f"统计参数量: {total_params:,}")
+    logger.info("后续将以下内容同步到提交目录:")
+    logger.info(f"  - 推理脚本: src/inference_esam_chineseclip_6cls.py 或 inference.py")
+    logger.info(f"  - 模型目录: {output_dir}")
     logger.info(f"{'=' * 50}")
 
 
-def main():
-    if not BASE_MODEL_DIR.exists():
-        logger.error(f"Base 模型不存在: {BASE_MODEL_DIR}")
-        sys.exit(1)
+def parse_args():
+    parser = argparse.ArgumentParser(description="导出提交所需的 sam3.pt + tokenizer/config 文件")
+    parser.add_argument(
+        "--preset",
+        default="efficientsam_easy_6cls_v1",
+        choices=sorted(PRESETS.keys()),
+        help="导出预设",
+    )
+    return parser.parse_args()
 
+
+def main() -> None:
     ensure_hf_cache()
-    export()
+    args = parse_args()
+    try:
+        export(args.preset)
+    except Exception as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

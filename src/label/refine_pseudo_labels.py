@@ -40,10 +40,10 @@ except Exception:  # pragma: no cover - tqdm 缺失时退化为普通迭代
 ROOT = Path(__file__).resolve().parents[2]
 
 # ── 用户配置区：平时直接改这里 ──────────────────────────────────────────
-REFINE_INPUT_JSON = ROOT / "test" / "sam3_label_output" / "pred_train_tasks.json"
+REFINE_INPUT_JSON = ROOT / "test" / "label_analysis" / "稀有类" / "val-out" / "pred_val_changwei.json"
 REFINE_VARIANT_JSONS: list[Path] = []
 REFINE_IMAGE_ROOT = ROOT
-REFINE_OUTPUT_DIR = ROOT / "test" / "label_analysis" / "label_analysis_ABC(train)"
+REFINE_OUTPUT_DIR = ROOT / "test" / "label_analysis" / "label_analysis_ABC(changwei-val)"
 # ─────────────────────────────────────────────────────────────────────
 
 

@@ -4,6 +4,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 HANXUE_ROOT = Path(__file__).resolve().parent
 
+
+def _resolve_first_existing_path(*candidates):
+    for candidate in candidates:
+        candidate = Path(candidate)
+        if candidate.exists():
+            return candidate
+    return Path(candidates[0])
+
 # 数据
 CLASSES = ["person", "car", "building", "tree", "animal", "computer"]
 PROMPT_THRESHOLDS = {
@@ -15,8 +23,16 @@ PROMPT_THRESHOLDS = {
     "computer": 0.60,
 }
 
-TRAIN_PRED_JSON = ROOT / "test" / "sam3_label_old" / "train_tasks" / "pred_train_tasks.json"
-VAL_PRED_JSON = ROOT / "test" / "sam3_label_old" / "val_tasks1" / "pred_val_tasks1.json"
+TRAIN_PRED_JSON = _resolve_first_existing_path(
+    ROOT / "test" / "sam3_label_old" / "train_tasks" / "pred_train_tasks.json",
+    ROOT / "test" / "sam3_label_new" / "pred_train_tasks.json",
+    ROOT / "test" / "clean_rare" / "label" / "train_label.json",
+)
+VAL_PRED_JSON = _resolve_first_existing_path(
+    ROOT / "test" / "sam3_label_old" / "val_tasks1" / "pred_val_tasks1.json",
+    ROOT / "test" / "sam3_label_new" / "pred_val_tasks.json",
+    ROOT / "test" / "clean_rare" / "label" / "val_label.json",
+)
 TRAIN_LIST = ROOT / "test" / "train_list.txt"
 VAL_LIST = ROOT / "test" / "val_list.txt"
 IMAGE_ROOT = ROOT
@@ -157,6 +173,13 @@ REQUIRED_PATHS = [
     EFFICIENT_SAM_CKPT,
 ]
 
-for required_path in REQUIRED_PATHS:
-    if not required_path.exists():
-        raise FileNotFoundError(f"hanxue 配置路径不存在: {required_path}")
+
+def validate_required_paths(required_paths=None):
+    missing_paths = []
+    for required_path in required_paths or REQUIRED_PATHS:
+        required_path = Path(required_path)
+        if not required_path.exists():
+            missing_paths.append(required_path)
+    if missing_paths:
+        missing_str = "\n".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"hanxue 配置路径不存在:\n{missing_str}")

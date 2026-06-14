@@ -71,6 +71,7 @@ from config_hanxue import (
     WARMUP_EPOCHS,
     WEIGHT_DECAY,
     WORKERS,
+    validate_required_paths,
 )
 from data.dataset import InfraredPromptDataset
 from models.custom_sam_model import CustomSAMWorldModel
@@ -629,6 +630,7 @@ def train():
 
 
 def main():
+    validate_required_paths()
     ckpt = train()
     logger.info(f"最终模型: {ckpt}")
     logger.info(f"日志: {LOG_FILE}")

@@ -3,11 +3,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-VAL_LIST = ROOT / "test" / "val_list.txt"
+VAL_LIST = ROOT / "test" / "train_list.txt"
 
 # 要筛选的文件夹，按需修改
-TARGET_FOLDERS = ["data1"]
-OUTPUT = ROOT / "test" / "val_list_d1.txt"
+TARGET_FOLDERS = ["data6"]
+OUTPUT = ROOT / "test" / "txt" / "train_list_d6.txt"
 
 
 def main():

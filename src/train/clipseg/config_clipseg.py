@@ -10,9 +10,9 @@ ROOT = Path(__file__).resolve().parents[3]
 # 数据
 # ══════════════════════════════════════════════════════════════════════
 
-CLASSES = ["person", "car", "building", "tree", "animal"]
-PRED_JSON = ROOT / "test" / "prompt_test_output" / "train_tasks" / "pred_train_tasks.json"
-VAL_PRED_JSON = ROOT / "test" / "prompt_test_output" / "val_tasks1" / "pred_val_tasks1.json"
+CLASSES = ["person", "car", "building", "tree", "animal","computer"]
+PRED_JSON = ROOT / "test" / "sam3_label_old" / "train_tasks" / "pred_train_tasks.json"
+VAL_PRED_JSON = ROOT / "test" / "sam3_label_old" / "val_tasks1" / "pred_val_tasks1.json"
 TRAIN_LIST = ROOT / "test" / "train_list.txt"
 VAL_LIST = ROOT / "test" / "val_list.txt"
 IMAGE_ROOT = ROOT
@@ -26,6 +26,7 @@ PROMPT_THRESHOLDS = {
     "building": 0.70,
     "tree":     0.60,
     "animal":   0.60,
+    "computer": 0.60,
 }
 
 # 是否在训练集构建时按 score 再做一次硬过滤。
@@ -37,16 +38,17 @@ VAL_THRESHOLDS = PROMPT_THRESHOLDS
 # 稀有类过采样倍数（仅训练集）
 RARE_OVERSAMPLE = {
     "animal": 3,
+    "computer": 3,
 }
 
 # 是否纳入 hit=false 的负样本；用较低比例先补拒识能力
 INCLUDE_NEGATIVE_SAMPLES = True
-NEGATIVE_SAMPLE_RATIO = 0.25
+NEGATIVE_SAMPLE_RATIO = 0.15
 NEGATIVE_SAMPLE_WEIGHT = 0.30
 
 # ══════════════════════════════════════════════════════════════════════
 # 模型
-# ══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 MODEL_NAME = "CIDAS/clipseg-rd64-refined"
 MODEL_DIR = ROOT / "model" / "clipseg-rd64-refined"
@@ -55,7 +57,7 @@ MODEL_DIR = ROOT / "model" / "clipseg-rd64-refined"
 # 训练
 # ══════════════════════════════════════════════════════════════════════
 
-IMG_SIZE = 1024                 # 等比例缩放 + pad 正方形
+IMG_SIZE = 768                # 等比例缩放 + pad 正方形
 BATCH = 4
 EPOCHS = 25                    # 单阶段 + 余弦退火
 DEVICE = 0
