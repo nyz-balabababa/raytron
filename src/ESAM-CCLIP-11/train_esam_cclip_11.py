@@ -177,6 +177,13 @@ def build_argparser():
     parser.add_argument("--no_print_trainable_params", dest="print_trainable_params", action="store_false")
     parser.add_argument("--use_prompt_prototype", dest="use_prompt_prototype", action="store_true")
     parser.add_argument("--no_prompt_prototype", dest="use_prompt_prototype", action="store_false")
+    parser.add_argument("--augment_prompt", dest="augment_prompt", action="store_true")
+    parser.add_argument("--no_augment_prompt", dest="augment_prompt", action="store_false")
+    parser.add_argument("--prompt_alias_train", dest="prompt_alias_train", action="store_true")
+    parser.add_argument("--no_prompt_alias_train", dest="prompt_alias_train", action="store_false")
+    parser.add_argument("--prompt_alias_prob", type=float, default=1.0)
+    parser.add_argument("--val_augment_prompt", dest="val_augment_prompt", action="store_true")
+    parser.add_argument("--no_val_augment_prompt", dest="val_augment_prompt", action="store_false")
     parser.add_argument("--text_cache_path", type=Path, default=TEXT_CACHE_PATH)
     parser.add_argument("--rebuild_text_cache", action="store_true", default=REBUILD_TEXT_CACHE)
     parser.add_argument("--use_image_cache", action="store_true", default=USE_IMAGE_CACHE)
@@ -206,6 +213,9 @@ def build_argparser():
         use_prompt_prototype=USE_PROMPT_PROTOTYPE,
         rare_balance_enabled=False,
         print_trainable_params=True,
+        augment_prompt=False,
+        prompt_alias_train=False,
+        val_augment_prompt=False,
     )
     return parser
 
@@ -282,7 +292,8 @@ def build_datasets(args):
         img_size=(args.img_size, args.img_size),
         classes=CLASSES,
         prompt_prototypes=args.prompt_prototype_cfg,
-        augment_prompt=False,
+        augment_prompt=args.augment_prompt,
+        prompt_alias_prob=args.prompt_alias_prob,
         hflip_prob=effective_hflip_prob,
         use_conf_filter=False,
         negative_sample_prob=args.negative_sample_ratio if INCLUDE_NEGATIVE_SAMPLES else 0.0,
@@ -308,7 +319,8 @@ def build_datasets(args):
             img_size=(args.img_size, args.img_size),
             classes=CLASSES,
             prompt_prototypes=args.prompt_prototype_cfg,
-            augment_prompt=False,
+            augment_prompt=args.val_augment_prompt,
+            prompt_alias_prob=1.0,
             hflip_prob=0.0,
             use_conf_filter=False,
             negative_sample_prob=0.0,
@@ -511,8 +523,32 @@ def class_weight_tensor(class_names, device, class_weights):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-def get_text_features(batch_class_names, text_cache_payload, device):
-    features = [text_cache_payload["embeddings"][class_name] for class_name in batch_class_names]
+def get_text_features(batch_text_keys, text_cache_payload, device):
+    embeddings = text_cache_payload.get("embeddings", {})
+    alias_embeddings = text_cache_payload.get("alias_embeddings") or text_cache_payload.get("prompt_embeddings") or {}
+    alias_to_class = text_cache_payload.get("_alias_to_class")
+    if alias_to_class is None:
+        alias_to_class = {}
+        for class_name, aliases in text_cache_payload.get("aliases", {}).items():
+            for alias in aliases:
+                alias_to_class[str(alias)] = str(class_name)
+        text_cache_payload["_alias_to_class"] = alias_to_class
+    features = []
+    missing = []
+    for text_key in batch_text_keys:
+        text_key = str(text_key)
+        if text_key in alias_embeddings:
+            features.append(alias_embeddings[text_key])
+        elif text_key in embeddings:
+            features.append(embeddings[text_key])
+        else:
+            class_name = alias_to_class.get(text_key)
+            if class_name is not None and class_name in embeddings:
+                features.append(embeddings[class_name])
+            else:
+                missing.append(text_key)
+    if missing:
+        raise RuntimeError(f"text cache 缺少文本 embedding: {missing[:10]}，请使用 --rebuild_text_cache")
     return torch.stack(features, dim=0).to(device)
 
 
@@ -569,6 +605,10 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion_dice, criteri
         masks = batch["masks"].to(device, non_blocking=True)
         sample_weight = batch["sample_weight"].to(device, non_blocking=True)
         class_names = batch["class_names"]
+        if args.prompt_alias_train and "prompt_texts" in batch:
+            text_keys = batch["prompt_texts"]
+        else:
+            text_keys = class_names
 
         if args.use_image_cache:
             image_features, hit_count, failed = encode_images_with_optional_cache(
@@ -586,7 +626,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion_dice, criteri
         else:
             image_features = model.encode_image(images)
 
-        text_features = get_text_features(class_names, text_cache_payload, device)
+        text_features = get_text_features(text_keys, text_cache_payload, device)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=args.amp and device.type == "cuda"):
@@ -887,8 +927,9 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
             history[key] = list(values)
         best_metrics = checkpoint.get(
             "best_metrics",
-            {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0},
+            {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_rescue": -1.0},
         )
+        best_metrics.setdefault("best_rescue", -1.0)
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         LOGGER.info("已恢复 epoch=%d, 下一轮从 epoch %d 开始。", int(checkpoint.get("epoch", 0)), start_epoch)
 
@@ -929,7 +970,12 @@ def main():
     LOGGER.info("unfreeze_image_mode=%s", args.unfreeze_image_mode)
     LOGGER.info("print_trainable_params=%s", args.print_trainable_params)
     LOGGER.info("use_prompt_prototype=%s", args.use_prompt_prototype)
+    LOGGER.info("augment_prompt=%s", args.augment_prompt)
+    LOGGER.info("prompt_alias_train=%s", args.prompt_alias_train)
+    LOGGER.info("prompt_alias_prob=%s", args.prompt_alias_prob)
+    LOGGER.info("val_augment_prompt=%s", args.val_augment_prompt)
     LOGGER.info("use_image_cache=%s", args.use_image_cache)
+    LOGGER.info("text_cache_path=%s", args.text_cache_path)
     LOGGER.info("epochs=%s", args.epochs)
     LOGGER.info("decoder_lr=%s image_lr=%s text_lr=%s", args.decoder_lr, args.image_lr, args.text_lr)
     LOGGER.info("warmup_epochs=%s", args.warmup_epochs)
@@ -942,7 +988,7 @@ def main():
     LOGGER.info("rare_balance_enabled=%s", args.rare_balance_enabled)
     LOGGER.info("rare_oversample=%s", args.rare_oversample)
     LOGGER.info("class_weights=%s", args.class_weights)
-    if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset"} and args.resume is None and args.resume_best is None:
+    if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset", "stage1_rare_rescue", "unfreeze_recalibrate", "text_realign_1ep"} and args.resume is None and args.resume_best is None:
         LOGGER.warning("preset=%s 建议显式传入 --resume_best 或 --resume 作为热启动起点。", args.preset)
     if args.unfreeze_image_mode != "none" and not args.no_auto_resume:
         LOGGER.warning("partial unfreeze 建议使用 --resume_best 和 --no_auto_resume，避免加载旧 optimizer 状态。")
@@ -994,8 +1040,16 @@ def main():
 
     LOGGER.info("开始加载 tokenizer: %s", args.tokenizer_dir)
     tokenizer = load_tokenizer(args.tokenizer_dir)
-    prototype_config = PROMPT_PROTOTYPES if args.use_prompt_prototype else {class_name: [class_name] for class_name in CLASSES}
+    preset_prompt_prototype_cfg = getattr(args, "prompt_prototype_cfg", None)
+    if args.use_prompt_prototype:
+        prototype_config = preset_prompt_prototype_cfg or PROMPT_PROTOTYPES
+    else:
+        prototype_config = {class_name: [class_name] for class_name in CLASSES}
     args.prompt_prototype_cfg = prototype_config
+    LOGGER.info("prompt prototype classes=%d", len(args.prompt_prototype_cfg))
+    for class_name in ("car", "window", "door", "pole_light"):
+        if class_name in args.prompt_prototype_cfg:
+            LOGGER.info("prompt aliases %s -> %s", class_name, args.prompt_prototype_cfg[class_name])
     LOGGER.info("开始%s text cache: %s", "重建" if args.rebuild_text_cache else "加载/构建", args.text_cache_path)
     text_cache_payload = load_or_build_text_cache(
         model=model,
@@ -1046,7 +1100,7 @@ def main():
 
     save_json(run_dir / "config_used.json", {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
     history = defaultdict(list)
-    best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0}
+    best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_rescue": -1.0}
     start_epoch = 1
     if resume_checkpoint_path is not None:
         start_epoch, history, best_metrics, _ = resume_training_state(
@@ -1126,6 +1180,8 @@ def main():
             current_old5 = val_metrics.get("iou/old5", 0.0)
             current_rare = val_metrics.get("iou/rare", 0.0)
             current_pos_only = val_metrics.get("iou/pos_only", 0.0)
+            rescue_score = current_all11 + 0.30 * current_rare - 0.50 * max(0.0, 0.655 - current_old5)
+            history["rescue_score"].append(rescue_score)
             if current_all11 > best_metrics["best_all11"]:
                 best_metrics["best_all11"] = current_all11
                 save_checkpoint(run_dir / "best_all11.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
@@ -1138,6 +1194,16 @@ def main():
             if current_pos_only > best_metrics["best_pos_only"]:
                 best_metrics["best_pos_only"] = current_pos_only
                 save_checkpoint(run_dir / "best_pos_only.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
+            if rescue_score > best_metrics["best_rescue"]:
+                best_metrics["best_rescue"] = rescue_score
+                save_checkpoint(run_dir / "best_rescue.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
+                LOGGER.info(
+                    "★ best_rescue 更新 rescue_score=%.4f all11=%.4f old5=%.4f rare=%.4f",
+                    rescue_score,
+                    current_all11,
+                    current_old5,
+                    current_rare,
+                )
 
     if last_epoch > 0:
         final_name = "final_fullset.pt" if args.no_val else "final_split.pt"

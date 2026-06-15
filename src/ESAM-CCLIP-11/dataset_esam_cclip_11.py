@@ -40,6 +40,7 @@ class ESAMCCLIP11Dataset(Dataset):
         tokenizer=None,
         prompt_prototypes=None,
         augment_prompt=False,
+        prompt_alias_prob=PROMPT_AUG_PROB,
         hflip_prob=0.5,
         use_conf_filter=False,
         negative_sample_prob=0.0,
@@ -65,6 +66,7 @@ class ESAMCCLIP11Dataset(Dataset):
         self.tokenizer = tokenizer
         self.prompt_prototypes = prompt_prototypes or {}
         self.augment_prompt = augment_prompt
+        self.prompt_alias_prob = float(prompt_alias_prob)
         self.hflip_prob = hflip_prob
         self.use_conf_filter = use_conf_filter
         self.negative_sample_prob = negative_sample_prob
@@ -293,7 +295,7 @@ class ESAMCCLIP11Dataset(Dataset):
 
         prompt = sample["prompt"]
         prompt_text = prompt
-        if self.augment_prompt and self.training and self.rng.random() < PROMPT_AUG_PROB:
+        if self.augment_prompt and self.training and self.rng.random() < self.prompt_alias_prob:
             prompt_text = self._augment_prompt(prompt)
 
         rgb = np.stack([gray, gray, gray], axis=-1).astype(np.float32) / 255.0

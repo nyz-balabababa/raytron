@@ -76,6 +76,51 @@ PROMPT_PROTOTYPES = {
     "motorcycle": ["motorcycle", "motorbike", "摩托车"],
 }
 
+TEXT_REALIGN_COMPLEX_ALIASES = {
+    "car": [
+        "草丛里的车",
+        "被树遮挡的车",
+        "远处的小车",
+        "car in bushes",
+        "car behind tree",
+        "small distant car",
+    ],
+    "window": [
+        "建筑上的窗户",
+        "车窗",
+        "building window",
+        "car window",
+        "window on building",
+    ],
+    "door": [
+        "车门",
+        "建筑门",
+        "car door",
+        "door of car",
+    ],
+    "pole_light": [
+        "路边的灯杆",
+        "远处的路灯",
+        "street light pole",
+        "light pole near road",
+    ],
+}
+
+
+def _merge_prompt_prototypes(base_prototypes, extra_aliases):
+    merged = {}
+    for class_name, aliases in base_prototypes.items():
+        deduped = []
+        for alias in list(aliases) + list(extra_aliases.get(class_name, [])):
+            alias = str(alias)
+            if alias not in deduped:
+                deduped.append(alias)
+        merged[class_name] = deduped
+    return merged
+
+
+TEXT_REALIGN_PROMPT_PROTOTYPES = _merge_prompt_prototypes(PROMPT_PROTOTYPES, TEXT_REALIGN_COMPLEX_ALIASES)
+
 PROMPT_ALIASES = {
     alias.lower(): class_name
     for class_name, aliases in PROMPT_PROTOTYPES.items()
@@ -120,9 +165,9 @@ MODEL_TYPE = "esam_chineseclip_decoder_11_split_control"
 DEVICE = "cuda"
 IMG_SIZE = 768
 ESAM_INPUT_SIZE = 1024
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 EPOCHS = 5
-WORKERS = 4
+WORKERS = 8
 SEED = 42
 AMP = True
 
@@ -183,8 +228,12 @@ POSTPROCESS_DEFAULT = {
 PRESET_CHOICES = (
     "base",
     "lite_fullset_polish",
+    "warm3_old_anchor_lite_v2",
     "split_bridge_stage1",
     "split_bridge_stage2_fullset",
+    "text_realign_1ep",
+    "unfreeze_recalibrate",
+    "stage1_rare_rescue",
     "rare_repair_lite",
     "partial_unfreeze_lastnorm",
     "partial_unfreeze_last1",
@@ -197,6 +246,29 @@ RARE_REPAIR_LITE_OVERSAMPLE = {
     "fence": 3,
     "pole_light": 3,
     "motorcycle": 2,
+}
+
+STAGE1_RARE_RESCUE_OVERSAMPLE = {
+    "trash can": 2,
+    "window": 2,
+    "door": 2,
+    "fence": 2,
+    "pole_light": 2,
+    "motorcycle": 2,
+}
+
+STAGE1_RARE_RESCUE_CLASS_WEIGHTS = {
+    "person": 1.0,
+    "car": 1.0,
+    "building": 1.0,
+    "tree": 1.0,
+    "animal": 1.0,
+    "trash can": 1.7,
+    "window": 1.55,
+    "door": 1.45,
+    "fence": 1.65,
+    "pole_light": 1.75,
+    "motorcycle": 1.6,
 }
 
 PRESET_CONFIGS = {
@@ -215,6 +287,54 @@ PRESET_CONFIGS = {
         "rare_class_keep_ratio": 1.0,
         "text_cache_path": CACHE_ROOT / "text_emb_11_lite_polish.pt",
         "rare_oversample": dict(RARE_OVERSAMPLE),
+    },
+    "warm3_old_anchor_lite_v2": {
+        # 从 3ep fullset warmup 底座开出的 old-anchor lite 分叉，不是继续纯热启动。
+        # 目标：old5 稳住，rare 不被压死，避免继续强 fullset 热启动贴伪标签主分布。
+        "run_name": "ESAM-CCLIP-11-warm3-old-anchor-lite-v2",
+        "epochs": 1,
+        "train_decoder_only": True,
+        "freeze_image_encoder": True,
+        "freeze_text_encoder": True,
+        "unfreeze_image_mode": "none",
+        "decoder_lr": 5e-5,
+        "image_lr": 0.0,
+        "text_lr": 0.0,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 0,
+        "min_lr_ratio": 0.20,
+        "negative_sample_ratio": 0.005,
+        "negative_sample_weight": 0.05,
+        "old_class_sample_ratio": 0.85,
+        "rare_class_keep_ratio": 1.0,
+        "rare_balance_enabled": False,
+        "augment_prompt": False,
+        "prompt_alias_train": False,
+        "prompt_alias_prob": 0.0,
+        "val_augment_prompt": False,
+        "use_prompt_prototype": True,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_warm3_old_anchor_lite_v2.pt",
+        "class_weights": {
+            "person": 1.03,
+            "car": 1.05,
+            "building": 1.05,
+            "tree": 1.03,
+            "animal": 1.00,
+            "trash can": 1.10,
+            "window": 1.05,
+            "door": 1.00,
+            "fence": 1.10,
+            "pole_light": 1.10,
+            "motorcycle": 1.05,
+        },
+        "rare_oversample": {
+            "trash can": 2,
+            "window": 1,
+            "door": 1,
+            "fence": 2,
+            "pole_light": 2,
+            "motorcycle": 1,
+        },
     },
     "split_bridge_stage1": {
         "run_name": "ESAM-CCLIP-11-split-bridge-stage1",
@@ -250,6 +370,91 @@ PRESET_CONFIGS = {
         "rare_class_keep_ratio": 1.0,
         "text_cache_path": CACHE_ROOT / "text_emb_11_split_bridge.pt",
         "rare_oversample": dict(RARE_OVERSAMPLE),
+    },
+    "text_realign_1ep": {
+        "run_name": "ESAM-CCLIP-11-text-realign-1ep",
+        "train_json": TRAIN_JSON,
+        "val_json": VAL_JSON,
+        "train_list": TRAIN_LIST,
+        "val_list": VAL_LIST,
+        "no_val": False,
+        "no_train_split_filter": False,
+        "epochs": 1,
+        "decoder_lr": 5e-6,
+        "image_lr": 0.0,
+        "text_lr": 0.0,
+        "warmup_epochs": 0,
+        "min_lr_ratio": 0.5,
+        "negative_sample_ratio": 0.005,
+        "negative_sample_weight": 0.05,
+        "rare_balance_enabled": False,
+        "old_class_sample_ratio": 1.0,
+        "rare_class_keep_ratio": 1.0,
+        "augment_prompt": True,
+        "prompt_alias_train": True,
+        "prompt_alias_prob": 1.0,
+        "val_augment_prompt": False,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_text_realign_alias.pt",
+        "prompt_prototype_cfg": dict(TEXT_REALIGN_PROMPT_PROTOTYPES),
+        "rare_oversample": dict(RARE_OVERSAMPLE),
+        "unfreeze_image_mode": "none",
+        "freeze_image_encoder": True,
+        "freeze_text_encoder": True,
+        "train_decoder_only": True,
+    },
+    "unfreeze_recalibrate": {
+        "run_name": "ESAM-CCLIP-11-unfreeze-recalibrate",
+        "train_json": TRAIN_JSON,
+        "val_json": VAL_JSON,
+        "train_list": TRAIN_LIST,
+        "val_list": VAL_LIST,
+        "no_val": False,
+        "no_train_split_filter": False,
+        "epochs": 1,
+        "decoder_lr": 1e-5,
+        "image_lr": 0.0,
+        "text_lr": 0.0,
+        "warmup_epochs": 0,
+        "min_lr_ratio": 0.5,
+        "negative_sample_ratio": 0.005,
+        "negative_sample_weight": 0.05,
+        "rare_balance_enabled": False,
+        "old_class_sample_ratio": 1.0,
+        "rare_class_keep_ratio": 1.0,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_unfreeze_recalibrate.pt",
+        "rare_oversample": dict(RARE_OVERSAMPLE),
+        "unfreeze_image_mode": "none",
+        "freeze_image_encoder": True,
+        "freeze_text_encoder": True,
+        "train_decoder_only": True,
+    },
+    "stage1_rare_rescue": {
+        "run_name": "ESAM-CCLIP-11-stage1-rare-rescue",
+        "train_json": TRAIN_JSON,
+        "val_json": VAL_JSON,
+        "train_list": TRAIN_LIST,
+        "val_list": VAL_LIST,
+        "no_val": False,
+        "no_train_split_filter": False,
+        "epochs": 2,
+        "decoder_lr": 2e-5,
+        "image_lr": 0.0,
+        "text_lr": 0.0,
+        "unfreeze_image_mode": "none",
+        "freeze_image_encoder": True,
+        "freeze_text_encoder": True,
+        "train_decoder_only": True,
+        "warmup_epochs": 1,
+        "min_lr_ratio": 0.3,
+        "negative_sample_ratio": 0.02,
+        "negative_sample_weight": 0.15,
+        "old_class_sample_ratio": 0.85,
+        "rare_class_keep_ratio": 1.0,
+        "rare_balance_enabled": True,
+        "use_prompt_prototype": True,
+        "text_cache_path": CACHE_ROOT / "text_emb_11_stage1_rare_rescue.pt",
+        "rare_oversample": dict(STAGE1_RARE_RESCUE_OVERSAMPLE),
+        "class_weights": dict(STAGE1_RARE_RESCUE_CLASS_WEIGHTS),
     },
     "rare_repair_lite": {
         "run_name": "ESAM-CCLIP-11-rare-repair-lite",
@@ -334,7 +539,11 @@ def apply_preset(args, explicit_dests=None):
     else:
         args.rare_oversample = dict(args.rare_oversample)
 
-    args.class_weights = dict(CLASS_WEIGHTS)
+    preset_class_weights = getattr(args, "class_weights", None)
+    if preset_class_weights is None:
+        args.class_weights = dict(CLASS_WEIGHTS)
+    else:
+        args.class_weights = dict(preset_class_weights)
     args.old_classes = list(RARE_BALANCED_OLD_CLASSES)
     args.rare_classes = list(RARE_BALANCED_RARE_CLASSES)
     return args

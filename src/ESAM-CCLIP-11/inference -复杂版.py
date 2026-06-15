@@ -57,16 +57,16 @@ DEFAULT_CLASSES = [
 
 DEFAULT_PROMPT_PROTOTYPES = {
     "person": ["person", "people", "pedestrian", "human", "人", "行人"],
-    "car": ["car", "vehicle", "automobile", "车辆", "汽车"],
+    "car": ["car", "vehicle", "automobile", "truck", "bus", "车辆", "汽车"],
     "building": ["building", "house", "architecture", "建筑", "楼"],
     "tree": ["tree", "vegetation", "树", "树木"],
     "animal": ["animal", "wild animal", "动物"],
-    "trash can": ["trash can", "garbage bin", "trashbin", "rubbish bin", "垃圾桶"],
+    "trash can": ["trash can", "trashcan", "garbage bin", "garbage can", "waste bin", "dustbin", "trashbin", "rubbish bin", "垃圾桶"],
     "window": ["window", "窗户"],
     "door": ["door", "entrance", "门"],
     "fence": ["fence", "railing", "栏杆", "围栏"],
-    "pole_light": ["pole_light", "street light", "lamp", "light pole", "路灯", "灯杆"],
-    "motorcycle": ["motorcycle", "motorbike", "摩托车"],
+    "pole_light": ["pole_light", "pole light", "street light", "streetlight", "lamp", "lamp post", "light pole", "utility pole", "路灯", "灯杆"],
+    "motorcycle": ["motorcycle", "motorbike", "motor bike", "scooter", "摩托车"],
 }
 
 DEFAULT_THRESHOLDS = {
@@ -404,80 +404,70 @@ def normalize_prompt_key(text: str) -> str:
 
 COMPLEX_PROMPT_ALIASES: Dict[str, List[str]] = {
     "car": [
-        "truck",
-        "bus",
-        "车辆",
-        "汽车",
         "车",
         "小车",
+        "汽车",
+        "车辆",
         "远处的车",
         "远处的小车",
         "草丛里的车",
         "被树遮挡的车",
         "被遮挡的车",
-        "car behind tree",
         "car in bushes",
+        "car behind tree",
         "partially occluded car",
         "small distant car",
         "vehicle on road",
     ],
     "window": [
-        "窗户",
-        "窗",
         "车窗",
         "汽车窗户",
+        "建筑窗户",
+        "楼上的窗户",
+        "窗户",
+        "窗",
+        "glass window",
         "car window",
         "building window",
         "window on building",
-        "建筑窗户",
-        "楼上的窗户",
-        "建筑上的窗户",
-        "glass window",
         "window of car",
     ],
     "door": [
-        "门",
         "车门",
         "汽车门",
-        "car door",
-        "building door",
-        "door of car",
         "建筑门",
+        "门",
+        "building door",
+        "car door",
+        "door of car",
         "door on vehicle",
     ],
     "pole_light": [
-        "pole light",
-        "streetlight",
-        "street light",
-        "lamp post",
-        "utility pole",
-        "street light pole",
-        "light pole",
         "路灯",
         "灯杆",
         "路边的路灯",
-        "路边的灯杆",
         "远处的灯杆",
+        "street light",
+        "light pole",
+        "lamp post",
+        "street light pole",
         "street light beside road",
     ],
     "motorcycle": [
-        "motor bike",
-        "scooter",
-        "motorbike",
         "摩托车",
         "远处的摩托车",
+        "motorcycle",
+        "motorbike",
+        "scooter",
         "small motorcycle",
     ],
     "trash can": [
-        "trashcan",
-        "trash can",
-        "garbage can",
-        "waste bin",
-        "dustbin",
-        "garbage bin",
         "垃圾桶",
         "路边的垃圾桶",
-        "rubbish bin",
+        "trash can",
+        "garbage bin",
+        "dustbin",
+        "waste bin",
     ],
 }
 ENGLISH_TARGET_RELATIONS = [" in ", " on ", " under ", " behind ", " near ", " beside ", " among ", " with ", " inside ", " at "]
@@ -916,20 +906,17 @@ def load_or_build_text_cache(
         device=device,
     )
     validate_text_cache(payload, classes, prompt_prototypes=prompt_prototypes)
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, cache_path)
-        save_json(
-            cache_path.with_suffix(".json"),
-            {
-                "classes": classes,
-                "aliases": payload["aliases"],
-                "prompt_prototypes_signature": payload["prompt_prototypes_signature"],
-            },
-        )
-        LOGGER.info("text cache saved: %s", cache_path)
-    except Exception as exc:
-        LOGGER.warning("text cache 保存失败，将继续使用内存 cache，不中断推理: %s reason=%s", cache_path, exc)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, cache_path)
+    save_json(
+        cache_path.with_suffix(".json"),
+        {
+            "classes": classes,
+            "aliases": payload["aliases"],
+            "prompt_prototypes_signature": payload["prompt_prototypes_signature"],
+        },
+    )
+    LOGGER.info("text cache saved: %s", cache_path)
     return payload
 
 
@@ -1361,15 +1348,16 @@ def resolve_prompt_inference_config(
     cli_raw_prompt_weight: Optional[float],
     cli_prompt_match_mode: Optional[str],
 ) -> Tuple[str, float, str]:
+    checkpoint = checkpoint or {}
     prompt_fusion_mode = cli_prompt_fusion_mode
     if prompt_fusion_mode is None:
-        prompt_fusion_mode = DEFAULT_PROMPT_FUSION_MODE
+        prompt_fusion_mode = str(checkpoint.get("prompt_fusion_mode", DEFAULT_PROMPT_FUSION_MODE))
     raw_prompt_weight = cli_raw_prompt_weight
     if raw_prompt_weight is None:
-        raw_prompt_weight = DEFAULT_RAW_PROMPT_WEIGHT
+        raw_prompt_weight = float(checkpoint.get("raw_prompt_weight", DEFAULT_RAW_PROMPT_WEIGHT))
     prompt_match_mode = cli_prompt_match_mode
     if prompt_match_mode is None:
-        prompt_match_mode = DEFAULT_PROMPT_MATCH_MODE
+        prompt_match_mode = str(checkpoint.get("prompt_match_mode", DEFAULT_PROMPT_MATCH_MODE))
     prompt_fusion_mode = prompt_fusion_mode if prompt_fusion_mode in {"prototype", "raw", "blend"} else DEFAULT_PROMPT_FUSION_MODE
     prompt_match_mode = prompt_match_mode if prompt_match_mode in {"exact", "soft", "target_soft"} else DEFAULT_PROMPT_MATCH_MODE
     raw_prompt_weight = min(max(float(raw_prompt_weight), 0.0), 1.0)
@@ -1548,13 +1536,14 @@ def resolve_checkpoint_prompt_prototypes(
     checkpoint: Dict[str, Any],
     classes: List[str],
 ) -> Dict[str, List[str]]:
-    return normalize_prompt_prototypes(DEFAULT_PROMPT_PROTOTYPES, classes)
+    raw_prompt_prototypes = checkpoint.get("prompt_prototypes", DEFAULT_PROMPT_PROTOTYPES)
+    return normalize_prompt_prototypes(raw_prompt_prototypes, classes)
 
 
 def resolve_checkpoint_thresholds(checkpoint: Dict[str, Any]) -> Dict[str, float]:
     raw_thresholds = (
-        checkpoint.get("val_thresholds")
-        or checkpoint.get("prompt_thresholds")
+        checkpoint.get("prompt_thresholds")
+        or checkpoint.get("val_thresholds")
         or DEFAULT_THRESHOLDS
     )
     return {str(key): float(value) for key, value in raw_thresholds.items()}
@@ -1757,47 +1746,32 @@ def process_tasks(
     LOGGER.info("final prompt_fusion_mode=%s", prompt_fusion_mode)
     LOGGER.info("final raw_prompt_weight=%.3f", raw_prompt_weight)
     LOGGER.info("final prompt_match_mode=%s", prompt_match_mode)
-    for prompt_text, expected in PROMPT_MATCH_SELFTEST_CASES:
-        resolved = resolve_prompt_mapped_class(prompt_text, prompt_aliases, classes, prompt_match_mode)
-        LOGGER.info(
-            "prompt selfcheck[%s]: %s -> %s (expected=%s)",
-            prompt_match_mode,
-            prompt_text,
-            resolved,
-            expected,
-        )
+    if prompt_match_mode == "target_soft":
+        for prompt_text, expected in PROMPT_MATCH_SELFTEST_CASES:
+            resolved = resolve_prompt_mapped_class(prompt_text, prompt_aliases, classes, prompt_match_mode)
+            LOGGER.info("target_soft selfcheck: %s -> %s (expected=%s)", prompt_text, resolved, expected)
     checkpoint_thresholds = resolve_checkpoint_thresholds(checkpoint) if isinstance(checkpoint, dict) else DEFAULT_THRESHOLDS
     checkpoint_postprocess = resolve_checkpoint_postprocess(checkpoint) if isinstance(checkpoint, dict) else DEFAULT_POSTPROCESS
-    threshold_source = "DEFAULT"
     if threshold_json is not None:
         LOGGER.info("使用 threshold_json: %s", threshold_json)
-        threshold_source = "threshold_json"
-    elif isinstance(checkpoint, dict) and "val_thresholds" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 val_thresholds")
-        threshold_source = "val_thresholds"
     elif isinstance(checkpoint, dict) and "prompt_thresholds" in checkpoint:
         LOGGER.info("使用 checkpoint 内 prompt_thresholds")
-        threshold_source = "prompt_thresholds"
+    elif isinstance(checkpoint, dict) and "val_thresholds" in checkpoint:
+        LOGGER.info("使用 checkpoint 内 val_thresholds")
     else:
         LOGGER.warning("checkpoint 内没有 val_thresholds，使用 DEFAULT_THRESHOLDS")
-    postprocess_source = "DEFAULT"
 
     if postprocess_json is not None:
         LOGGER.info("使用 postprocess_json: %s", postprocess_json)
-        postprocess_source = "postprocess_json"
     elif isinstance(checkpoint, dict) and "postprocess_cfg" in checkpoint:
         LOGGER.info("使用 checkpoint 内 postprocess_cfg")
-        postprocess_source = "postprocess_cfg"
     elif isinstance(checkpoint, dict) and "postprocess" in checkpoint:
         LOGGER.info("使用 checkpoint 内 postprocess")
-        postprocess_source = "postprocess"
     else:
         LOGGER.warning("checkpoint 内没有 postprocess_cfg，使用 DEFAULT_POSTPROCESS")
 
     thresholds = checkpoint_thresholds if threshold_json is None else json.loads(Path(threshold_json).read_text(encoding="utf-8"))
     postprocess_cfg = checkpoint_postprocess if postprocess_json is None else json.loads(Path(postprocess_json).read_text(encoding="utf-8"))
-    LOGGER.info("final threshold source=%s", threshold_source)
-    LOGGER.info("final postprocess source=%s", postprocess_source)
     prompt_feature_cache: Dict[str, Tuple[torch.Tensor, Optional[str]]] = {}
 
     model_info = count_model_params(model, device)
@@ -1814,9 +1788,6 @@ def process_tasks(
     model_info["prompt_fusion_mode"] = prompt_fusion_mode
     model_info["raw_prompt_weight"] = float(raw_prompt_weight)
     model_info["prompt_match_mode"] = prompt_match_mode
-    model_info["threshold_source"] = threshold_source
-    model_info["postprocess_source"] = postprocess_source
-    model_info["rare_empty_fallback_enabled"] = bool(rare_empty_fallback)
     if isinstance(checkpoint, dict):
         for key in ["epoch", "run_name", "model_type", "val_thresholds", "prompt_thresholds", "sweep_mode", "sweep_metric"]:
             if key in checkpoint:

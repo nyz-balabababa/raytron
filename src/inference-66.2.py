@@ -37,9 +37,6 @@ DEFAULT_MASK_THRESHOLD = 0.5
 DEFAULT_SUBMIT_IMG_SIZE = 768
 PROMPT_BATCH_SIZE = 16
 MAX_TEXT_LEN = 15
-DEFAULT_PROMPT_FUSION_MODE = "prototype"
-DEFAULT_RAW_PROMPT_WEIGHT = 0.0
-DEFAULT_PROMPT_MATCH_MODE = "exact"
 
 DEFAULT_CLASSES = [
     "person",
@@ -65,7 +62,7 @@ DEFAULT_PROMPT_PROTOTYPES = {
     "window": ["window", "窗户"],
     "door": ["door", "entrance", "门"],
     "fence": ["fence", "railing", "栏杆", "围栏"],
-    "pole_light": ["pole_light", "street light", "lamp", "light pole", "路灯", "灯杆"],
+    "pole_light": ["pole_light", "pole light", "street light", "lamp", "light pole", "路灯", "灯杆"],
     "motorcycle": ["motorcycle", "motorbike", "摩托车"],
 }
 
@@ -95,31 +92,6 @@ DEFAULT_POSTPROCESS = {
     "fence": {"min_area": 2, "fill_holes": False},
     "pole_light": {"min_area": 1, "fill_holes": False},
     "motorcycle": {"min_area": 4, "fill_holes": False},
-}
-
-RARE_FALLBACK_CLASSES = {
-    "trash can",
-    "window",
-    "door",
-    "fence",
-    "pole_light",
-    "motorcycle",
-}
-RARE_EMPTY_FALLBACK_DELTA = 0.05
-RARE_EMPTY_FALLBACK_CFG = {
-    "trash can": {"min_area": 2, "topk_components": 1},
-    "window": {"min_area": 2, "topk_components": 2},
-    "door": {"min_area": 4, "topk_components": 1},
-    "fence": {"min_area": 1, "topk_components": 3},
-    "pole_light": {"min_area": 1, "topk_components": 2},
-    "motorcycle": {"min_area": 2, "topk_components": 1},
-}
-LARGE_AREA_DEBUG_THRESHOLDS = {
-    "person": 0.35,
-    "car": 0.40,
-    "building": 0.85,
-    "tree": 0.70,
-    "animal": 0.20,
 }
 
 PSEUDO_COLOR_SAT_THRESH = 60.0
@@ -397,124 +369,11 @@ def count_model_params(model: torch.nn.Module, device: torch.device) -> Dict[str
     }
 
 
-def normalize_prompt_key(text: str) -> str:
-    normalized = str(text).strip().lower().replace("_", " ").replace("-", " ")
-    return " ".join(normalized.split())
-
-
-COMPLEX_PROMPT_ALIASES: Dict[str, List[str]] = {
-    "car": [
-        "truck",
-        "bus",
-        "车辆",
-        "汽车",
-        "车",
-        "小车",
-        "远处的车",
-        "远处的小车",
-        "草丛里的车",
-        "被树遮挡的车",
-        "被遮挡的车",
-        "car behind tree",
-        "car in bushes",
-        "partially occluded car",
-        "small distant car",
-        "vehicle on road",
-    ],
-    "window": [
-        "窗户",
-        "窗",
-        "车窗",
-        "汽车窗户",
-        "car window",
-        "building window",
-        "window on building",
-        "建筑窗户",
-        "楼上的窗户",
-        "建筑上的窗户",
-        "glass window",
-        "window of car",
-    ],
-    "door": [
-        "门",
-        "车门",
-        "汽车门",
-        "car door",
-        "building door",
-        "door of car",
-        "建筑门",
-        "door on vehicle",
-    ],
-    "pole_light": [
-        "pole light",
-        "streetlight",
-        "street light",
-        "lamp post",
-        "utility pole",
-        "street light pole",
-        "light pole",
-        "路灯",
-        "灯杆",
-        "路边的路灯",
-        "路边的灯杆",
-        "远处的灯杆",
-        "street light beside road",
-    ],
-    "motorcycle": [
-        "motor bike",
-        "scooter",
-        "motorbike",
-        "摩托车",
-        "远处的摩托车",
-        "small motorcycle",
-    ],
-    "trash can": [
-        "trashcan",
-        "trash can",
-        "garbage can",
-        "waste bin",
-        "dustbin",
-        "garbage bin",
-        "垃圾桶",
-        "路边的垃圾桶",
-        "rubbish bin",
-    ],
-}
-ENGLISH_TARGET_RELATIONS = [" in ", " on ", " under ", " behind ", " near ", " beside ", " among ", " with ", " inside ", " at "]
-PROMPT_MATCH_SELFTEST_CASES: List[Tuple[str, Optional[str]]] = [
-    ("草丛里的车", "car"),
-    ("被树遮挡的车", "car"),
-    ("远处的小车", "car"),
-    ("建筑上的窗户", "window"),
-    ("车窗", "window"),
-    ("车门", "door"),
-    ("路边的灯杆", "pole_light"),
-    ("路边的垃圾桶", "trash can"),
-    ("car in bushes", "car"),
-    ("car behind tree", "car"),
-    ("window on building", "window"),
-    ("door of car", "door"),
-    ("car window", "window"),
-    ("street light pole", "pole_light"),
-    ("cart", None),
-    ("street", None),
-]
-
-
-def build_complex_prompt_alias_map(classes: List[str]) -> Dict[str, str]:
-    alias_map: Dict[str, str] = {}
-    for class_name in classes:
-        for alias in COMPLEX_PROMPT_ALIASES.get(class_name, []):
-            alias_map[normalize_prompt_key(alias)] = class_name
-    return alias_map
-
-
 def build_prompt_aliases(prompt_prototypes: Dict[str, List[str]], classes: List[str]) -> Dict[str, str]:
     aliases: Dict[str, str] = {}
     for class_name in classes:
         for alias in prompt_prototypes.get(class_name, [class_name]) + [class_name]:
-            aliases[normalize_prompt_key(alias)] = class_name
-    aliases.update(build_complex_prompt_alias_map(classes))
+            aliases[str(alias).strip().lower()] = class_name
     return aliases
 
 
@@ -690,9 +549,10 @@ def preprocess_image(image_path: str, input_size: int) -> Tuple[torch.Tensor, Di
     return torch.from_numpy(rgb).float(), meta
 
 
-def logits_to_probability_map(
+def logits_to_mask(
     logits: torch.Tensor,
     meta: Dict[str, int],
+    threshold: float,
     input_size: int,
 ) -> Tuple[np.ndarray, float]:
     if logits.ndim == 2:
@@ -717,16 +577,6 @@ def logits_to_probability_map(
     prob = cv2.resize(prob, (meta["orig_w"], meta["orig_h"]), interpolation=cv2.INTER_LINEAR)
 
     score = float(prob.max()) if prob.size > 0 else 0.0
-    return prob, score
-
-
-def logits_to_mask(
-    logits: torch.Tensor,
-    meta: Dict[str, int],
-    threshold: float,
-    input_size: int,
-) -> Tuple[np.ndarray, float]:
-    prob, score = logits_to_probability_map(logits, meta, input_size)
     return (prob >= threshold).astype(np.uint8), score
 
 
@@ -752,36 +602,8 @@ def fill_small_holes(mask: np.ndarray) -> np.ndarray:
     return canvas.astype(np.uint8)
 
 
-def keep_top_k_components(mask: np.ndarray, topk_components: Optional[int]) -> np.ndarray:
-    if topk_components is None or int(topk_components) <= 0:
-        return (mask > 0).astype(np.uint8)
-    binary = (mask > 0).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    if num_labels <= 1:
-        return binary
-    components: List[Tuple[int, int]] = []
-    for label_idx in range(1, num_labels):
-        area = int(stats[label_idx, cv2.CC_STAT_AREA])
-        if area > 0:
-            components.append((area, label_idx))
-    if not components:
-        return np.zeros_like(binary)
-    components.sort(reverse=True)
-    keep_labels = {label_idx for _, label_idx in components[: int(topk_components)]}
-    filtered = np.zeros_like(binary)
-    for label_idx in keep_labels:
-        filtered[labels == label_idx] = 1
-    return filtered
-
-
-def apply_postprocess(
-    mask: np.ndarray,
-    min_area: int = 0,
-    fill_holes: bool = False,
-    topk_components: Optional[int] = None,
-) -> np.ndarray:
+def apply_postprocess(mask: np.ndarray, min_area: int = 0, fill_holes: bool = False) -> np.ndarray:
     processed = remove_small_components(mask, min_area=min_area)
-    processed = keep_top_k_components(processed, topk_components=topk_components)
     if fill_holes:
         processed = fill_small_holes(processed)
     return processed.astype(np.uint8)
@@ -916,20 +738,17 @@ def load_or_build_text_cache(
         device=device,
     )
     validate_text_cache(payload, classes, prompt_prototypes=prompt_prototypes)
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, cache_path)
-        save_json(
-            cache_path.with_suffix(".json"),
-            {
-                "classes": classes,
-                "aliases": payload["aliases"],
-                "prompt_prototypes_signature": payload["prompt_prototypes_signature"],
-            },
-        )
-        LOGGER.info("text cache saved: %s", cache_path)
-    except Exception as exc:
-        LOGGER.warning("text cache 保存失败，将继续使用内存 cache，不中断推理: %s reason=%s", cache_path, exc)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, cache_path)
+    save_json(
+        cache_path.with_suffix(".json"),
+        {
+            "classes": classes,
+            "aliases": payload["aliases"],
+            "prompt_prototypes_signature": payload["prompt_prototypes_signature"],
+        },
+    )
+    LOGGER.info("text cache saved: %s", cache_path)
     return payload
 
 
@@ -1173,207 +992,7 @@ def load_checkpoint_flexible(
 
 
 def map_prompt_to_known_class(prompt_text: str, prompt_aliases: Dict[str, str]) -> Optional[str]:
-    return prompt_aliases.get(normalize_prompt_key(prompt_text))
-
-
-def is_short_english_alias(alias_norm: str) -> bool:
-    if not alias_norm:
-        return False
-    if any(ord(ch) > 127 for ch in alias_norm):
-        return False
-    compact = alias_norm.replace(" ", "")
-    return len(compact) < 3
-
-
-def contains_non_ascii(text: str) -> bool:
-    return any(ord(ch) > 127 for ch in str(text))
-
-
-def token_sequence_in_prompt(prompt_norm: str, alias_norm: str) -> bool:
-    prompt_tokens = prompt_norm.split()
-    alias_tokens = alias_norm.split()
-    if not prompt_tokens or not alias_tokens or len(alias_tokens) > len(prompt_tokens):
-        return False
-    window = len(alias_tokens)
-    for start in range(0, len(prompt_tokens) - window + 1):
-        if prompt_tokens[start:start + window] == alias_tokens:
-            return True
-    return False
-
-
-def extract_chinese_target_phrase(prompt_text: str) -> Optional[str]:
-    prompt_norm = normalize_prompt_key(prompt_text)
-    if "的" not in prompt_norm:
-        return None
-    target_phrase = prompt_norm.rsplit("的", 1)[-1].strip()
-    return target_phrase or None
-
-
-def extract_english_target_phrase(prompt_norm: str) -> Optional[str]:
-    prompt_norm = normalize_prompt_key(prompt_norm)
-    if not prompt_norm:
-        return None
-    if " of " in prompt_norm:
-        target_phrase = prompt_norm.split(" of ", 1)[0].strip()
-        if target_phrase:
-            return target_phrase
-    for relation_token in ENGLISH_TARGET_RELATIONS:
-        if relation_token in prompt_norm:
-            target_phrase = prompt_norm.split(relation_token, 1)[0].strip()
-            if target_phrase:
-                return target_phrase
-    return None
-
-
-def collect_soft_match_candidates(
-    prompt_norm: str,
-    alias_to_class: Dict[str, str],
-    classes: List[str],
-    complex_aliases: Optional[Dict[str, str]] = None,
-) -> List[Tuple[int, int, int, int, str]]:
-    rare_classes = RARE_FALLBACK_CLASSES.intersection(set(classes))
-    complex_aliases = complex_aliases or {}
-    candidates: List[Tuple[int, int, int, int, str]] = []
-    for alias_norm, class_name in alias_to_class.items():
-        if not alias_norm or alias_norm == prompt_norm:
-            continue
-        if is_short_english_alias(alias_norm):
-            continue
-        if contains_non_ascii(alias_norm):
-            matched = alias_norm in prompt_norm
-        else:
-            matched = token_sequence_in_prompt(prompt_norm, alias_norm)
-        if not matched:
-            continue
-        is_complex = 1 if alias_norm in complex_aliases else 0
-        token_count = len(alias_norm.split())
-        rare_priority = 1 if class_name in rare_classes else 0
-        candidates.append((is_complex, token_count, len(alias_norm), rare_priority, class_name))
-    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
-    return candidates
-
-
-def match_target_phrase_to_class(
-    target_phrase: str,
-    prompt_aliases: Dict[str, str],
-    complex_prompt_aliases: Dict[str, str],
-    classes: List[str],
-) -> Optional[str]:
-    target_norm = normalize_prompt_key(target_phrase)
-    if not target_norm:
-        return None
-    exact_complex = complex_prompt_aliases.get(target_norm)
-    if exact_complex is not None:
-        return exact_complex
-    exact = prompt_aliases.get(target_norm)
-    if exact is not None:
-        return exact
-    candidates = collect_soft_match_candidates(
-        prompt_norm=target_norm,
-        alias_to_class=prompt_aliases,
-        classes=classes,
-        complex_aliases=complex_prompt_aliases,
-    )
-    return candidates[0][4] if candidates else None
-
-
-def map_prompt_to_known_class_soft(
-    prompt_text: str,
-    prompt_aliases: Dict[str, str],
-    classes: List[str],
-) -> Optional[str]:
-    exact = map_prompt_to_known_class(prompt_text, prompt_aliases)
-    if exact is not None:
-        return exact
-    prompt_norm = normalize_prompt_key(prompt_text)
-    if not prompt_norm:
-        return None
-    complex_prompt_aliases = build_complex_prompt_alias_map(classes)
-    candidates = collect_soft_match_candidates(
-        prompt_norm=prompt_norm,
-        alias_to_class=prompt_aliases,
-        classes=classes,
-        complex_aliases=complex_prompt_aliases,
-    )
-    return candidates[0][4] if candidates else None
-
-
-def map_prompt_to_known_class_target_soft(
-    prompt_text: str,
-    prompt_aliases: Dict[str, str],
-    classes: List[str],
-) -> Optional[str]:
-    exact = map_prompt_to_known_class(prompt_text, prompt_aliases)
-    if exact is not None:
-        return exact
-    prompt_norm = normalize_prompt_key(prompt_text)
-    if not prompt_norm:
-        return None
-    complex_prompt_aliases = build_complex_prompt_alias_map(classes)
-    complex_candidates = collect_soft_match_candidates(
-        prompt_norm=prompt_norm,
-        alias_to_class=complex_prompt_aliases,
-        classes=classes,
-        complex_aliases=complex_prompt_aliases,
-    )
-    if complex_candidates:
-        return complex_candidates[0][4]
-    chinese_target = extract_chinese_target_phrase(prompt_text)
-    if chinese_target:
-        matched = match_target_phrase_to_class(chinese_target, prompt_aliases, complex_prompt_aliases, classes)
-        if matched is not None:
-            return matched
-    english_target = extract_english_target_phrase(prompt_norm)
-    if english_target:
-        matched = match_target_phrase_to_class(english_target, prompt_aliases, complex_prompt_aliases, classes)
-        if matched is not None:
-            return matched
-    return map_prompt_to_known_class_soft(prompt_text, prompt_aliases, classes)
-
-
-def run_prompt_match_selfcheck(
-    prompt_aliases: Dict[str, str],
-    classes: List[str],
-    prompt_match_mode: str,
-) -> List[Tuple[str, Optional[str]]]:
-    return [
-        (prompt_text, resolve_prompt_mapped_class(prompt_text, prompt_aliases, classes, prompt_match_mode))
-        for prompt_text, _ in PROMPT_MATCH_SELFTEST_CASES
-    ]
-
-
-def resolve_prompt_mapped_class(
-    prompt_text: str,
-    prompt_aliases: Dict[str, str],
-    classes: List[str],
-    prompt_match_mode: str = DEFAULT_PROMPT_MATCH_MODE,
-) -> Optional[str]:
-    if prompt_match_mode == "target_soft":
-        return map_prompt_to_known_class_target_soft(prompt_text, prompt_aliases, classes)
-    if prompt_match_mode == "soft":
-        return map_prompt_to_known_class_soft(prompt_text, prompt_aliases, classes)
-    return map_prompt_to_known_class(prompt_text, prompt_aliases)
-
-
-def resolve_prompt_inference_config(
-    checkpoint: Optional[Dict[str, Any]],
-    cli_prompt_fusion_mode: Optional[str],
-    cli_raw_prompt_weight: Optional[float],
-    cli_prompt_match_mode: Optional[str],
-) -> Tuple[str, float, str]:
-    prompt_fusion_mode = cli_prompt_fusion_mode
-    if prompt_fusion_mode is None:
-        prompt_fusion_mode = DEFAULT_PROMPT_FUSION_MODE
-    raw_prompt_weight = cli_raw_prompt_weight
-    if raw_prompt_weight is None:
-        raw_prompt_weight = DEFAULT_RAW_PROMPT_WEIGHT
-    prompt_match_mode = cli_prompt_match_mode
-    if prompt_match_mode is None:
-        prompt_match_mode = DEFAULT_PROMPT_MATCH_MODE
-    prompt_fusion_mode = prompt_fusion_mode if prompt_fusion_mode in {"prototype", "raw", "blend"} else DEFAULT_PROMPT_FUSION_MODE
-    prompt_match_mode = prompt_match_mode if prompt_match_mode in {"exact", "soft", "target_soft"} else DEFAULT_PROMPT_MATCH_MODE
-    raw_prompt_weight = min(max(float(raw_prompt_weight), 0.0), 1.0)
-    return prompt_fusion_mode, raw_prompt_weight, prompt_match_mode
+    return prompt_aliases.get(str(prompt_text).strip().lower())
 
 
 def build_text_feature_for_prompt(
@@ -1384,67 +1003,36 @@ def build_text_feature_for_prompt(
     prompt_aliases: Dict[str, str],
     device: torch.device,
     prompt_feature_cache: Optional[Dict[str, Tuple[torch.Tensor, Optional[str]]]] = None,
-    prompt_fusion_mode: str = DEFAULT_PROMPT_FUSION_MODE,
-    raw_prompt_weight: float = DEFAULT_RAW_PROMPT_WEIGHT,
-    prompt_match_mode: str = DEFAULT_PROMPT_MATCH_MODE,
 ) -> Tuple[torch.Tensor, Optional[str]]:
-    prompt_text = str(prompt_text).strip()
-    raw_prompt_weight = min(max(float(raw_prompt_weight), 0.0), 1.0)
-    cache_key = f"{prompt_text}||{prompt_fusion_mode}||{raw_prompt_weight:.6f}||{prompt_match_mode}"
+    cache_key = str(prompt_text).strip()
     if prompt_feature_cache is not None and cache_key in prompt_feature_cache:
         cached_feature, cached_mapped_class = prompt_feature_cache[cache_key]
         return cached_feature.to(device, non_blocking=True), cached_mapped_class
 
-    mapped_class = resolve_prompt_mapped_class(
-        prompt_text=prompt_text,
-        prompt_aliases=prompt_aliases,
-        classes=list(text_cache_payload.get("classes", DEFAULT_CLASSES)),
-        prompt_match_mode=prompt_match_mode,
-    )
+    mapped_class = map_prompt_to_known_class(prompt_text, prompt_aliases)
     device_embeddings = text_cache_payload.get("device_embeddings", {})
-
-    def encode_raw_prompt_feature(text: str) -> torch.Tensor:
-        raw_cache_key = f"__raw__::{text}"
-        if prompt_feature_cache is not None and raw_cache_key in prompt_feature_cache:
-            cached_feature, _ = prompt_feature_cache[raw_cache_key]
-            return cached_feature.to(device, non_blocking=True)
-        encoded = tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=MAX_TEXT_LEN,
-            return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
-        feature = model.encode_text(input_ids, attention_mask).detach()
-        feature = normalize_text_feature(feature)
-        if feature.ndim == 2:
-            feature = feature[0]
-        feature = normalize_text_feature(feature.unsqueeze(0))[0]
-        if prompt_feature_cache is not None:
-            prompt_feature_cache[raw_cache_key] = (feature.detach().cpu(), None)
-        return feature
-
     if mapped_class is not None and mapped_class in device_embeddings:
-        prototype_feature = device_embeddings[mapped_class]
-        if prototype_feature.ndim == 2:
-            prototype_feature = prototype_feature[0]
-        prototype_feature = normalize_text_feature(prototype_feature.unsqueeze(0))[0]
-        if prompt_fusion_mode == "prototype":
-            final_feature = prototype_feature
-        elif prompt_fusion_mode == "raw":
-            final_feature = encode_raw_prompt_feature(prompt_text)
-        else:
-            raw_prompt_feature = encode_raw_prompt_feature(prompt_text)
-            blended = (1.0 - raw_prompt_weight) * prototype_feature + raw_prompt_weight * raw_prompt_feature
-            final_feature = normalize_text_feature(blended.unsqueeze(0))[0]
-        resolved = normalize_text_feature(final_feature.unsqueeze(0))[0], mapped_class
+        feature = device_embeddings[mapped_class]
+        if feature.ndim == 1:
+            feature = feature.unsqueeze(0)
+        resolved = feature[0], mapped_class
         if prompt_feature_cache is not None:
             prompt_feature_cache[cache_key] = (resolved[0].detach().cpu(), resolved[1])
         return resolved
 
-    feature = encode_raw_prompt_feature(prompt_text)
+    encoded = tokenizer(
+        prompt_text,
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_TEXT_LEN,
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    feature = model.encode_text(input_ids, attention_mask).detach()
+    feature = normalize_text_feature(feature)
+    if feature.ndim == 2:
+        feature = feature[0]
     resolved = feature, None
     if prompt_feature_cache is not None:
         prompt_feature_cache[cache_key] = (resolved[0].detach().cpu(), resolved[1])
@@ -1468,30 +1056,6 @@ def get_prompt_postprocess(
 ) -> Dict[str, Any]:
     key = mapped_class if mapped_class is not None else prompt_text
     return postprocess_cfg.get(key, {"min_area": 0, "fill_holes": False})
-
-
-def apply_rare_empty_fallback(
-    prob: np.ndarray,
-    class_name: Optional[str],
-    threshold: float,
-    base_post_cfg: Dict[str, Any],
-) -> Optional[np.ndarray]:
-    if class_name not in RARE_FALLBACK_CLASSES:
-        return None
-    fallback_cfg = RARE_EMPTY_FALLBACK_CFG.get(class_name or "")
-    if fallback_cfg is None:
-        return None
-    fallback_threshold = max(0.0, float(threshold) - RARE_EMPTY_FALLBACK_DELTA)
-    fallback_mask = (prob >= fallback_threshold).astype(np.uint8)
-    fallback_mask = apply_postprocess(
-        fallback_mask,
-        min_area=int(fallback_cfg.get("min_area", 0)),
-        fill_holes=bool(base_post_cfg.get("fill_holes", False)),
-        topk_components=int(fallback_cfg.get("topk_components", 0)),
-    )
-    if int(fallback_mask.sum()) <= 0:
-        return None
-    return fallback_mask
 
 
 def choose_tokenizer_dir(model_dir: Path, tokenizer_path: Optional[str]) -> str:
@@ -1548,13 +1112,14 @@ def resolve_checkpoint_prompt_prototypes(
     checkpoint: Dict[str, Any],
     classes: List[str],
 ) -> Dict[str, List[str]]:
-    return normalize_prompt_prototypes(DEFAULT_PROMPT_PROTOTYPES, classes)
+    raw_prompt_prototypes = checkpoint.get("prompt_prototypes", DEFAULT_PROMPT_PROTOTYPES)
+    return normalize_prompt_prototypes(raw_prompt_prototypes, classes)
 
 
 def resolve_checkpoint_thresholds(checkpoint: Dict[str, Any]) -> Dict[str, float]:
     raw_thresholds = (
-        checkpoint.get("val_thresholds")
-        or checkpoint.get("prompt_thresholds")
+        checkpoint.get("prompt_thresholds")
+        or checkpoint.get("val_thresholds")
         or DEFAULT_THRESHOLDS
     )
     return {str(key): float(value) for key, value in raw_thresholds.items()}
@@ -1562,19 +1127,16 @@ def resolve_checkpoint_thresholds(checkpoint: Dict[str, Any]) -> Dict[str, float
 
 def resolve_checkpoint_postprocess(checkpoint: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     raw_postprocess = (
-        checkpoint.get("postprocess_cfg")
-        or checkpoint.get("postprocess")
+        checkpoint.get("postprocess")
+        or checkpoint.get("postprocess_cfg")
         or DEFAULT_POSTPROCESS
     )
     normalized: Dict[str, Dict[str, Any]] = {}
     for key, cfg in raw_postprocess.items():
-        normalized_cfg = {
+        normalized[str(key)] = {
             "min_area": int(cfg.get("min_area", 0)),
             "fill_holes": bool(cfg.get("fill_holes", False)),
         }
-        if "topk_components" in cfg and cfg.get("topk_components") is not None:
-            normalized_cfg["topk_components"] = int(cfg.get("topk_components", 0))
-        normalized[str(key)] = normalized_cfg
     return normalized
 
 
@@ -1641,20 +1203,12 @@ def do_inference(
     postprocess_cfg: Dict[str, Dict[str, Any]],
     prompt_aliases: Dict[str, str],
     default_mask_threshold: float,
-    rare_empty_fallback: bool = False,
     prompt_feature_cache: Optional[Dict[str, Tuple[torch.Tensor, Optional[str]]]] = None,
-    prompt_fusion_mode: str = DEFAULT_PROMPT_FUSION_MODE,
-    raw_prompt_weight: float = DEFAULT_RAW_PROMPT_WEIGHT,
-    prompt_match_mode: str = DEFAULT_PROMPT_MATCH_MODE,
-) -> Tuple[Dict[str, Dict[str, Any]], int, int, Dict[str, Any]]:
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     device = next(model.parameters()).device
     image_tensor, meta = preprocess_image(image_path, model_input_size)
     image_embedding = model.encode_image(image_tensor.unsqueeze(0).to(device, non_blocking=True))
     results_by_prompt: Dict[str, Dict[str, Any]] = {}
-    debug_stats: Dict[str, Any] = {
-        "fallback_hit_count": 0,
-        "fallback_by_class": defaultdict(int),
-    }
 
     for start in range(0, len(text_prompts), PROMPT_BATCH_SIZE):
         prompt_batch = text_prompts[start:start + PROMPT_BATCH_SIZE]
@@ -1669,9 +1223,6 @@ def do_inference(
                 prompt_aliases=prompt_aliases,
                 device=device,
                 prompt_feature_cache=prompt_feature_cache,
-                prompt_fusion_mode=prompt_fusion_mode,
-                raw_prompt_weight=raw_prompt_weight,
-                prompt_match_mode=prompt_match_mode,
             )
             feature_list.append(feature)
             mapped_classes.append(mapped_class)
@@ -1692,20 +1243,12 @@ def do_inference(
         for prompt_text, mapped_class, prompt_logits in zip(prompt_batch, mapped_classes, logits):
             threshold = get_prompt_threshold(prompt_text, mapped_class, thresholds, default_mask_threshold)
             post_cfg = get_prompt_postprocess(prompt_text, mapped_class, postprocess_cfg)
-            prob, score = logits_to_probability_map(prompt_logits, meta, model_input_size)
-            mask = (prob >= threshold).astype(np.uint8)
+            mask, score = logits_to_mask(prompt_logits, meta, threshold, model_input_size)
             mask = apply_postprocess(
                 mask,
                 min_area=int(post_cfg.get("min_area", 0)),
                 fill_holes=bool(post_cfg.get("fill_holes", False)),
-                topk_components=post_cfg.get("topk_components"),
             )
-            if mask.sum() == 0 and rare_empty_fallback:
-                fallback_mask = apply_rare_empty_fallback(prob, mapped_class, threshold, post_cfg)
-                if fallback_mask is not None and int(fallback_mask.sum()) > 0:
-                    mask = fallback_mask
-                    debug_stats["fallback_hit_count"] += 1
-                    debug_stats["fallback_by_class"][mapped_class or prompt_text] += 1
             if mask.sum() == 0:
                 continue
             results_by_prompt[prompt_text] = {
@@ -1713,11 +1256,10 @@ def do_inference(
                 "mapped_class": mapped_class,
                 "score": float(score),
                 "threshold": float(threshold),
-                "mask_area": int(mask.sum()),
                 "rle": encode_mask_to_rle(mask),
             }
 
-    return results_by_prompt, int(meta["orig_w"]), int(meta["orig_h"]), debug_stats
+    return results_by_prompt, int(meta["orig_w"]), int(meta["orig_h"])
 
 
 def process_tasks(
@@ -1733,10 +1275,6 @@ def process_tasks(
     postprocess_json: Optional[str] = None,
     fail_safe: bool = True,
     save_debug_json: bool = False,
-    rare_empty_fallback: bool = False,
-    prompt_fusion_mode: Optional[str] = None,
-    raw_prompt_weight: Optional[float] = None,
-    prompt_match_mode: Optional[str] = None,
 ) -> None:
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -1748,56 +1286,28 @@ def process_tasks(
         text_cache_path=text_cache_path,
     )
     device = next(model.parameters()).device
-    prompt_fusion_mode, raw_prompt_weight, prompt_match_mode = resolve_prompt_inference_config(
-        checkpoint,
-        prompt_fusion_mode,
-        raw_prompt_weight,
-        prompt_match_mode,
-    )
-    LOGGER.info("final prompt_fusion_mode=%s", prompt_fusion_mode)
-    LOGGER.info("final raw_prompt_weight=%.3f", raw_prompt_weight)
-    LOGGER.info("final prompt_match_mode=%s", prompt_match_mode)
-    for prompt_text, expected in PROMPT_MATCH_SELFTEST_CASES:
-        resolved = resolve_prompt_mapped_class(prompt_text, prompt_aliases, classes, prompt_match_mode)
-        LOGGER.info(
-            "prompt selfcheck[%s]: %s -> %s (expected=%s)",
-            prompt_match_mode,
-            prompt_text,
-            resolved,
-            expected,
-        )
     checkpoint_thresholds = resolve_checkpoint_thresholds(checkpoint) if isinstance(checkpoint, dict) else DEFAULT_THRESHOLDS
     checkpoint_postprocess = resolve_checkpoint_postprocess(checkpoint) if isinstance(checkpoint, dict) else DEFAULT_POSTPROCESS
-    threshold_source = "DEFAULT"
     if threshold_json is not None:
         LOGGER.info("使用 threshold_json: %s", threshold_json)
-        threshold_source = "threshold_json"
-    elif isinstance(checkpoint, dict) and "val_thresholds" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 val_thresholds")
-        threshold_source = "val_thresholds"
     elif isinstance(checkpoint, dict) and "prompt_thresholds" in checkpoint:
         LOGGER.info("使用 checkpoint 内 prompt_thresholds")
-        threshold_source = "prompt_thresholds"
+    elif isinstance(checkpoint, dict) and "val_thresholds" in checkpoint:
+        LOGGER.info("使用 checkpoint 内 val_thresholds")
     else:
         LOGGER.warning("checkpoint 内没有 val_thresholds，使用 DEFAULT_THRESHOLDS")
-    postprocess_source = "DEFAULT"
 
     if postprocess_json is not None:
         LOGGER.info("使用 postprocess_json: %s", postprocess_json)
-        postprocess_source = "postprocess_json"
-    elif isinstance(checkpoint, dict) and "postprocess_cfg" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 postprocess_cfg")
-        postprocess_source = "postprocess_cfg"
     elif isinstance(checkpoint, dict) and "postprocess" in checkpoint:
         LOGGER.info("使用 checkpoint 内 postprocess")
-        postprocess_source = "postprocess"
+    elif isinstance(checkpoint, dict) and "postprocess_cfg" in checkpoint:
+        LOGGER.info("使用 checkpoint 内 postprocess_cfg")
     else:
         LOGGER.warning("checkpoint 内没有 postprocess_cfg，使用 DEFAULT_POSTPROCESS")
 
     thresholds = checkpoint_thresholds if threshold_json is None else json.loads(Path(threshold_json).read_text(encoding="utf-8"))
     postprocess_cfg = checkpoint_postprocess if postprocess_json is None else json.loads(Path(postprocess_json).read_text(encoding="utf-8"))
-    LOGGER.info("final threshold source=%s", threshold_source)
-    LOGGER.info("final postprocess source=%s", postprocess_source)
     prompt_feature_cache: Dict[str, Tuple[torch.Tensor, Optional[str]]] = {}
 
     model_info = count_model_params(model, device)
@@ -1811,12 +1321,6 @@ def process_tasks(
     model_info["use_prompt_prototype"] = bool(text_cache_payload.get("use_prompt_prototype", True))
     model_info["text_cache_classes"] = list(text_cache_payload.get("classes", classes))
     model_info["text_cache_signature"] = text_cache_payload.get("prompt_prototypes_signature")
-    model_info["prompt_fusion_mode"] = prompt_fusion_mode
-    model_info["raw_prompt_weight"] = float(raw_prompt_weight)
-    model_info["prompt_match_mode"] = prompt_match_mode
-    model_info["threshold_source"] = threshold_source
-    model_info["postprocess_source"] = postprocess_source
-    model_info["rare_empty_fallback_enabled"] = bool(rare_empty_fallback)
     if isinstance(checkpoint, dict):
         for key in ["epoch", "run_name", "model_type", "val_thresholds", "prompt_thresholds", "sweep_mode", "sweep_metric"]:
             if key in checkpoint:
@@ -1833,10 +1337,6 @@ def process_tasks(
     empty_mask_count = 0
     class_pred_count: Dict[str, int] = defaultdict(int)
     class_empty_count: Dict[str, int] = defaultdict(int)
-    pred_area_ratio_values: Dict[str, List[float]] = defaultdict(list)
-    large_area_count_by_class: Dict[str, int] = defaultdict(int)
-    fallback_hit_count = 0
-    fallback_by_class: Dict[str, int] = defaultdict(int)
 
     for image_rel_path, image_tasks in maybe_tqdm(
         tasks_by_image.items(),
@@ -1848,7 +1348,7 @@ def process_tasks(
         image_start = time.time()
         try:
             unique_prompts = list(dict.fromkeys(get_prompt_text(task) for task in image_tasks))
-            results_by_prompt, width, height, image_debug_stats = do_inference(
+            results_by_prompt, width, height = do_inference(
                 image_path=image_abs_path,
                 text_prompts=unique_prompts,
                 model=model,
@@ -1859,26 +1359,13 @@ def process_tasks(
                 postprocess_cfg=postprocess_cfg,
                 prompt_aliases=prompt_aliases,
                 default_mask_threshold=mask_threshold,
-                rare_empty_fallback=rare_empty_fallback,
                 prompt_feature_cache=prompt_feature_cache,
-                prompt_fusion_mode=prompt_fusion_mode,
-                raw_prompt_weight=raw_prompt_weight,
-                prompt_match_mode=prompt_match_mode,
             )
-            fallback_hit_count += int(image_debug_stats.get("fallback_hit_count", 0))
-            for class_name, hit_count in image_debug_stats.get("fallback_by_class", {}).items():
-                fallback_by_class[str(class_name)] += int(hit_count)
             empty_rle = empty_mask_rle(height, width)
-            image_area = max(int(width) * int(height), 1)
             for task in image_tasks:
                 ann_id = task["ann_id"]
                 prompt_text = get_prompt_text(task)
-                prompt_class_key = resolve_prompt_mapped_class(
-                    prompt_text,
-                    prompt_aliases,
-                    classes,
-                    prompt_match_mode=prompt_match_mode,
-                ) or prompt_text
+                prompt_class_key = map_prompt_to_known_class(prompt_text, prompt_aliases) or prompt_text
                 prediction = results_by_prompt.get(prompt_text)
                 if prediction is None:
                     task_to_rle[ann_id] = empty_rle
@@ -1888,11 +1375,6 @@ def process_tasks(
                     task_to_rle[ann_id] = prediction["rle"]
                     pred_class_key = prediction.get("mapped_class") or prompt_class_key
                     class_pred_count[pred_class_key] += 1
-                    mask_area = int(prediction.get("mask_area", 0))
-                    area_ratio = float(mask_area / image_area)
-                    pred_area_ratio_values[pred_class_key].append(area_ratio)
-                    if area_ratio >= float(LARGE_AREA_DEBUG_THRESHOLDS.get(pred_class_key, 1.01)):
-                        large_area_count_by_class[pred_class_key] += 1
         except Exception as exc:
             if not fail_safe:
                 raise
@@ -1915,12 +1397,7 @@ def process_tasks(
                     }
                 )
                 prompt_text = get_prompt_text(task)
-                prompt_class_key = resolve_prompt_mapped_class(
-                    prompt_text,
-                    prompt_aliases,
-                    classes,
-                    prompt_match_mode=prompt_match_mode,
-                ) or prompt_text
+                prompt_class_key = map_prompt_to_known_class(prompt_text, prompt_aliases) or prompt_text
                 class_empty_count[prompt_class_key] += 1
         inference_total_time += time.time() - image_start
         processed_images += 1
@@ -1945,20 +1422,6 @@ def process_tasks(
         "class_prediction_stats": {
             "pred_count": {key: int(value) for key, value in sorted(class_pred_count.items())},
             "empty_count": {key: int(value) for key, value in sorted(class_empty_count.items())},
-            "pred_area_ratio_by_class": {
-                key: float(sum(values) / max(len(values), 1))
-                for key, values in sorted(pred_area_ratio_values.items())
-            },
-            "large_area_count_by_class": {
-                key: int(value) for key, value in sorted(large_area_count_by_class.items())
-            },
-        },
-        "rare_fallback_stats": {
-            "rare_empty_fallback_enabled": bool(rare_empty_fallback),
-            "fallback_hit_count": int(fallback_hit_count),
-            "fallback_by_class": {
-                key: int(value) for key, value in sorted(fallback_by_class.items())
-            },
         },
     }
     if failed_items:
@@ -1979,11 +1442,6 @@ def process_tasks(
     LOGGER.info("处理 task 数: %d", len(tasks))
     LOGGER.info("empty_mask_count: %d", empty_mask_count)
     LOGGER.info("failed_count: %d", len(failed_items))
-    LOGGER.info("rare_empty_fallback_enabled: %s", rare_empty_fallback)
-    LOGGER.info("fallback_hit_count: %d", fallback_hit_count)
-    LOGGER.info("prompt_fusion_mode: %s", prompt_fusion_mode)
-    LOGGER.info("raw_prompt_weight: %.3f", raw_prompt_weight)
-    LOGGER.info("prompt_match_mode: %s", prompt_match_mode)
 
 
 def main() -> None:
@@ -2005,10 +1463,6 @@ def main() -> None:
     parser.add_argument("--mask_threshold", type=float, default=DEFAULT_MASK_THRESHOLD)
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--save_debug_json", action="store_true")
-    parser.add_argument("--rare_empty_fallback", action="store_true")
-    parser.add_argument("--prompt_fusion_mode", choices=["prototype", "raw", "blend"], default=None)
-    parser.add_argument("--raw_prompt_weight", type=float, default=None)
-    parser.add_argument("--prompt_match_mode", choices=["exact", "soft", "target_soft"], default=None)
     args = parser.parse_args()
 
     print("=" * 60)
@@ -2021,10 +1475,6 @@ def main() -> None:
     print(f"模型检查点: {args.checkpoint}")
     print(f"默认输入尺寸: {DEFAULT_SUBMIT_IMG_SIZE} (若 checkpoint 含 img_size 则优先使用)")
     print(f"设备: {'cuda' if torch.cuda.is_available() else 'cpu'}")
-    print(f"rare empty fallback: {args.rare_empty_fallback}")
-    print(f"prompt fusion mode(cli): {args.prompt_fusion_mode}")
-    print(f"raw prompt weight(cli): {args.raw_prompt_weight}")
-    print(f"prompt match mode(cli): {args.prompt_match_mode}")
     print("=" * 60)
 
     tasks = load_tasks(resolve_path(args.tasks) or args.tasks)
@@ -2041,10 +1491,6 @@ def main() -> None:
         postprocess_json=resolve_path(args.postprocess_json) if args.postprocess_json else None,
         fail_safe=not args.strict,
         save_debug_json=args.save_debug_json,
-        rare_empty_fallback=args.rare_empty_fallback,
-        prompt_fusion_mode=args.prompt_fusion_mode,
-        raw_prompt_weight=args.raw_prompt_weight,
-        prompt_match_mode=args.prompt_match_mode,
     )
 
 

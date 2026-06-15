@@ -1,4 +1,6 @@
 import logging
+import hashlib
+import json
 from pathlib import Path
 
 import torch
@@ -7,6 +9,27 @@ from config_esam_cclip_11 import CLASSES, PROMPT_PROTOTYPES
 from common_esam_cclip_11 import maybe_tqdm, normalize_text_feature, save_json
 
 LOGGER = logging.getLogger("ESAM_CCLIP_11")
+
+
+def normalize_prompt_prototypes(classes, prompt_prototypes):
+    normalized = {}
+    for class_name in classes:
+        aliases = prompt_prototypes.get(class_name, [class_name])
+        cleaned = []
+        for alias in aliases:
+            alias = str(alias)
+            if alias not in cleaned:
+                cleaned.append(alias)
+        if class_name not in cleaned:
+            cleaned.insert(0, class_name)
+        normalized[class_name] = cleaned
+    return normalized
+
+
+def build_prompt_prototypes_signature(classes, prompt_prototypes):
+    normalized = normalize_prompt_prototypes(classes, prompt_prototypes)
+    payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest(), normalized
 
 
 def validate_text_cache(payload, classes):
@@ -29,7 +52,8 @@ def validate_text_cache(payload, classes):
 
 def build_text_cache_payload(model, tokenizer, classes, prompt_prototypes, device):
     embeddings = {}
-    aliases_used = {}
+    alias_embeddings = {}
+    prompt_signature, aliases_used = build_prompt_prototypes_signature(classes, prompt_prototypes)
     iterator = maybe_tqdm(
         classes,
         total=len(classes),
@@ -37,10 +61,8 @@ def build_text_cache_payload(model, tokenizer, classes, prompt_prototypes, devic
         leave=False,
     )
     for class_name in iterator:
-        aliases = prompt_prototypes.get(class_name, [class_name])
-        aliases_used[class_name] = aliases
         emb_list = []
-        for alias in aliases:
+        for alias in aliases_used[class_name]:
             encoded = tokenizer(
                 alias,
                 padding="max_length",
@@ -52,13 +74,17 @@ def build_text_cache_payload(model, tokenizer, classes, prompt_prototypes, devic
             attention_mask = encoded["attention_mask"].to(device)
             text_feature = model.encode_text(input_ids, attention_mask)
             text_feature = normalize_text_feature(text_feature).detach().cpu()
-            emb_list.append(text_feature[0])
+            alias_feature = text_feature[0].cpu()
+            emb_list.append(alias_feature)
+            alias_embeddings[str(alias)] = alias_feature
         prototype = normalize_text_feature(torch.stack(emb_list, dim=0).mean(dim=0, keepdim=True))[0]
         embeddings[class_name] = prototype.cpu()
     return {
         "classes": list(classes),
         "use_prompt_prototype": True,
+        "prompt_prototypes_signature": prompt_signature,
         "embeddings": embeddings,
+        "alias_embeddings": alias_embeddings,
         "aliases": aliases_used,
     }
 
@@ -80,13 +106,27 @@ def load_or_build_text_cache(
 ):
     classes = classes or CLASSES
     prompt_prototypes = prompt_prototypes or PROMPT_PROTOTYPES
+    expected_signature, normalized_aliases = build_prompt_prototypes_signature(classes, prompt_prototypes)
     if cache_path.exists() and not rebuild:
         payload = torch.load(cache_path, map_location="cpu", weights_only=False)
         validate_text_cache(payload, classes)
-        LOGGER.info("loaded text cache: %s", cache_path)
-        for class_name, aliases in payload.get("aliases", {}).items():
-            LOGGER.info("prototype aliases %s -> %s", class_name, aliases)
-        return payload
+        cache_signature = payload.get("prompt_prototypes_signature")
+        if cache_signature is not None:
+            if cache_signature != expected_signature:
+                LOGGER.warning("text cache signature mismatch, rebuild: %s", cache_path)
+            else:
+                LOGGER.info("loaded text cache: %s", cache_path)
+                for class_name, aliases in payload.get("aliases", {}).items():
+                    LOGGER.info("prototype aliases %s -> %s", class_name, aliases)
+                return payload
+        else:
+            cache_aliases = normalize_prompt_prototypes(classes, payload.get("aliases", {}))
+            if cache_aliases == normalized_aliases:
+                LOGGER.info("loaded text cache: %s", cache_path)
+                for class_name, aliases in payload.get("aliases", {}).items():
+                    LOGGER.info("prototype aliases %s -> %s", class_name, aliases)
+                return payload
+            LOGGER.warning("text cache aliases mismatch, rebuild: %s", cache_path)
 
     payload = build_text_cache_payload(
         model=model,
