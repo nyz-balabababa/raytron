@@ -5,8 +5,9 @@
 
 ## 1. 结论先看
 
-当前最强的本地同口径 sweep 结果仍然是 `lite` 主线：
+当前最强的本地同口径 sweep 结果仍然是 `lite` 主线，而且最新补扫后最优项已经从 `lite_hybrid` 更新为 `lite_stage2_submit`：
 
+- `threshold_sweep_esam_11_lite_stage2_submit`: `best_metric = 0.578766`
 - `threshold_sweep_esam_11_hybrid_lite`: `best_metric = 0.578131`
 
 目前几条关键线的判断：
@@ -102,7 +103,13 @@
 后续 sweep 结果：
 
 - `threshold_sweep_lite_recall`: `best_metric=0.570989`
+- `threshold_sweep_esam_11_lite_stage2_submit`: `best_metric=0.578766`
 - `threshold_sweep_esam_11_hybrid_lite`: `best_metric=0.578131`
+
+`lite_stage2_submit` 关键统计：
+
+- `old5_avg=0.655602`
+- `rare6_avg=0.514737`
 
 `hybrid_lite` 关键统计：
 
@@ -113,6 +120,7 @@
 
 - 这是路线一里真正“把分拉上来”的关键节点。
 - `old-balanced` 不是最终最稳的提交版本，但它是后面 `lite-fullset-polish` 的核心基础。
+- 最新补扫说明：在 `old-balanced/final_fullset.pt` 上，`stage2_submit_safe + submit_clean prompt prototypes` 这套提交型规则，比原来的 `hybrid_lite` 又高了 `0.000635`，属于当前最强 lite 本地 sweep。
 
 #### C. `ESAM-CCLIP-11-rare-balanced`
 
@@ -648,29 +656,76 @@
 
 | 结果 | `best_metric` | 备注 |
 |---|---:|---|
-| `threshold_sweep_esam_11_hybrid_lite` | `0.578131` | 当前最强 lite 主线 |
+| `threshold_sweep_esam_11_lite_stage2_submit` | `0.578766` | 当前最强 lite 提交型 sweep |
+| `threshold_sweep_esam_11_hybrid_lite` | `0.578131` | lite hybrid 参考线 |
 | `threshold_sweep_lite_recall` | `0.570989` | 旧 lite recall 版本 |
 | `threshold_sweep_esam_11_hybrid_stage2` | `0.562322` | 路线二 stage2 |
+| `threshold_sweep_esam_11_stage2_refine` | `0.557326` | stage2 提交细调版 |
+| `threshold_sweep_esam_11_stage2_submit` | `0.556997` | stage2 submit-safe 基线 |
 | `threshold_sweep_stage1_unfreeze_hybrid` | `0.548433` | 路线三 unfreeze |
 | `threshold_sweep_esam_11_mid_safe` | `0.536587` | split-control / mid safe |
 
-### 3.1 哪些结果距离 lite 主线在 0.03 以内
+### 3.1 本轮新增四组 sweep 的直接结论
 
-以当前最高的 `lite_hybrid = 0.578131` 为基准：
+本轮你重点比较的四组结果，本质上分成两对：
 
-- `stage2_hybrid = 0.562322`
-  - 差值 `0.015809`
-- `stage1_unfreeze_hybrid = 0.548433`
-  - 差值 `0.029698`
+- `lite_stage2_submit = 0.578766`
+- `lite_hybrid = 0.578131`
+- `stage2_refine = 0.557326`
+- `stage2_submit = 0.556997`
 
-在 `0.03` 以内的只有这两条。
+直接结论：
 
-### 3.2 stage2 和 lite 的结构差异
+- `lite_stage2_submit` 比 `lite_hybrid` 高 `0.000635`
+- `stage2_refine` 比 `stage2_submit` 高 `0.000329`
+- `stage2_hybrid = 0.562322` 仍然高于 `stage2_refine` 和 `stage2_submit`
+- 所以目前排序是：
+  - `lite_stage2_submit`
+  - `lite_hybrid`
+  - `stage2_hybrid`
+  - `stage2_refine`
+  - `stage2_submit`
+
+### 3.2 这几类 sweep 分别扫了什么规则
+
+`lite_stage2_submit`：
+
+- 扫描对象：`ESAM-CCLIP-11-old-balanced/final_fullset.pt`
+- 使用规则：`stage2_submit_safe`
+- prompt 规则：`submit_clean` prototypes + `prototype` fusion + `raw_prompt_weight=0.0` + `exact` match
+- 特点：old 类用较窄阈值/面积网格，rare 类固定保守 postprocess，只在提交型阈值网格上搜索
+
+`lite_hybrid`：
+
+- 扫描对象：`ESAM-CCLIP-11-old-balanced/final_fullset.pt`
+- 使用规则：`hybrid`
+- 特点：old 类走 `best` 风格，rare 类走 `fine_recall` 风格，是更典型的“old 保守、rare 放宽”混合扫法
+
+`stage2_submit`：
+
+- 扫描对象：`ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt`
+- 使用规则：`stage2_submit_safe`
+- prompt 规则同样是 `submit_clean + prototype + exact`
+- 特点：和 `lite_stage2_submit` 同口径，但底座换成 stage2 系权重
+
+`stage2_refine`：
+
+- 扫描对象：`ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt`
+- 使用规则：`stage2_refine`
+- prompt 规则同样是 `submit_clean + prototype + exact`
+- 特点：在 `stage2_submit_safe` 基础上，把 old/rare 的阈值和 `min_area` 再做一轮更细的局部搜索，rare 还额外细扫了少量 `topk_components`
+
+### 3.3 stage2 和 lite 的结构差异
 
 `stage2_hybrid`：
 
 - `old5_avg=0.656215`
 - `rare6_avg=0.484078`
+
+`lite_stage2_submit`：
+
+- `old5_avg=0.655602`
+- `rare6_avg=0.514737`
 
 `lite_hybrid`：
 
@@ -679,11 +734,11 @@
 
 结论：
 
-- `stage2` 的 old 只有极小幅度提升
-- `rare` 比 `lite` 低了约 `0.0295`
-- 也就是说：**stage2 相比 lite，是 old 小幅波动式提升，但 rare 明显下降**
+- `stage2` 的 old 只有极小幅度提升，甚至放到 `lite_stage2_submit` 对比里也几乎拉不开
+- `rare` 比 `lite` 低了约 `0.0307`（按 `lite_stage2_submit` 对 `stage2_hybrid` 算）
+- 也就是说：**stage2 相比 lite，仍然是 old 没形成决定性优势，但 rare 明显下降**
 
-### 3.3 stage1 / rare-rescue / unfreeze 的对比
+### 3.4 stage1 / rare-rescue / unfreeze 的对比
 
 训练验证口径下：
 
@@ -707,7 +762,7 @@
 - `stage1_unfreeze_recalibrate_1ep` 说明“解冻后回冻校准”方向是正向的
 - 但 `unfreeze` 体系整体的后续 sweep 还没有吃出足够收益，因此还不宜当主线
 
-### 3.4 四条 split 后续修复线并排看
+### 3.5 四条 split 后续修复线并排看
 
 这里单独把最容易混的四条线放一起：
 
@@ -777,7 +832,7 @@
 按“已验证的可提交竞争力”排：
 
 1. 路线一 `lite` 主线
-   - 代表 sweep：`threshold_sweep_esam_11_hybrid_lite`
+   - 代表 sweep：`threshold_sweep_esam_11_lite_stage2_submit`
 2. 路线二 `stage2`
    - 代表 sweep：`threshold_sweep_esam_11_hybrid_stage2`
 3. 路线三 `stage1 unfreeze`

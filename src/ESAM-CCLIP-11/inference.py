@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -54,6 +55,22 @@ DEFAULT_CLASSES = [
     "pole_light",
     "motorcycle",
 ]
+DEFAULT_OLD5_CLASSES = ["person", "car", "building", "tree", "animal"]
+DEFAULT_RARE6_CLASSES = ["trash can", "window", "door", "fence", "pole_light", "motorcycle"]
+DEFAULT_ROUTE_MAP = {
+    "person": "lite",
+    "car": "lite",
+    "building": "lite",
+    "tree": "lite",
+    "animal": "lite",
+    "trash can": "stage2",
+    "window": "stage2",
+    "door": "stage2",
+    "fence": "stage2",
+    "pole_light": "stage2",
+    "motorcycle": "stage2",
+}
+DEFAULT_ROUTER_MAX_RUNTIME_PARAMS = 300_000_000
 
 DEFAULT_PROMPT_PROTOTYPES = {
     "person": ["person", "people", "pedestrian", "human", "人", "行人"],
@@ -395,6 +412,10 @@ def count_model_params(model: torch.nn.Module, device: torch.device) -> Dict[str
         "total_params_m": float(total_params),
         "trainable_params_m": float(trainable_params),
     }
+
+
+def count_tensor_params(state_dict: Dict[str, Any]) -> int:
+    return int(sum(value.numel() for value in state_dict.values() if torch.is_tensor(value)))
 
 
 def normalize_prompt_key(text: str) -> str:
@@ -894,12 +915,12 @@ def build_text_cache_payload(
 def load_or_build_text_cache(
     model,
     tokenizer,
-    cache_path: Path,
+    cache_path: Optional[Path],
     classes: List[str],
     prompt_prototypes: Dict[str, List[str]],
     device: torch.device,
 ) -> Dict[str, Any]:
-    if cache_path.exists():
+    if cache_path is not None and cache_path.exists():
         try:
             payload = torch.load(cache_path, map_location="cpu", weights_only=False)
             validate_text_cache(payload, classes, prompt_prototypes=prompt_prototypes)
@@ -907,6 +928,10 @@ def load_or_build_text_cache(
             return payload
         except Exception as exc:
             LOGGER.warning("text cache 校验失败，将重建: %s reason=%s", cache_path, exc)
+    elif cache_path is None:
+        LOGGER.info("未提供本地 text cache，将基于 checkpoint prompt_prototypes 直接构建内存 cache。")
+    else:
+        LOGGER.info("本地 text cache 不存在，将基于 checkpoint prompt_prototypes 自动重建: %s", cache_path)
 
     payload = build_text_cache_payload(
         model=model,
@@ -916,20 +941,21 @@ def load_or_build_text_cache(
         device=device,
     )
     validate_text_cache(payload, classes, prompt_prototypes=prompt_prototypes)
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, cache_path)
-        save_json(
-            cache_path.with_suffix(".json"),
-            {
-                "classes": classes,
-                "aliases": payload["aliases"],
-                "prompt_prototypes_signature": payload["prompt_prototypes_signature"],
-            },
-        )
-        LOGGER.info("text cache saved: %s", cache_path)
-    except Exception as exc:
-        LOGGER.warning("text cache 保存失败，将继续使用内存 cache，不中断推理: %s reason=%s", cache_path, exc)
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, cache_path)
+            save_json(
+                cache_path.with_suffix(".json"),
+                {
+                    "classes": classes,
+                    "aliases": payload["aliases"],
+                    "prompt_prototypes_signature": payload["prompt_prototypes_signature"],
+                },
+            )
+            LOGGER.info("text cache saved: %s", cache_path)
+        except Exception as exc:
+            LOGGER.warning("text cache 保存失败，将继续使用内存 cache，不中断推理: %s reason=%s", cache_path, exc)
     return payload
 
 
@@ -1172,6 +1198,141 @@ def load_checkpoint_flexible(
     return checkpoint, missing_keys, unexpected_keys
 
 
+def normalize_decoder_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    normalized: Dict[str, torch.Tensor] = {}
+    for raw_key, value in state_dict.items():
+        key = remap_key(str(raw_key))
+        if key.startswith("decoder."):
+            key = key[len("decoder.") :]
+        normalized[key] = value
+    return normalized
+
+
+def validate_router_route_map(route_map: Dict[str, str], classes: List[str]) -> Dict[str, str]:
+    normalized = {str(key): str(value) for key, value in route_map.items()}
+    missing_classes = [class_name for class_name in classes if class_name not in normalized]
+    if missing_classes:
+        raise RuntimeError(f"router route_map 缺少类别: {missing_classes}")
+    invalid_routes = {class_name: route for class_name, route in normalized.items() if route not in {"lite", "stage2"}}
+    if invalid_routes:
+        raise RuntimeError(f"router route_map 存在非法 route: {invalid_routes}")
+    return normalized
+
+
+def resolve_prompt_route(
+    mapped_class: Optional[str],
+    route_map: Optional[Dict[str, str]],
+) -> str:
+    if mapped_class is None or route_map is None:
+        return "lite"
+    return route_map.get(mapped_class, "lite")
+
+
+def load_decoder_module_state(
+    decoder_module: torch.nn.Module,
+    decoder_state_dict: Dict[str, torch.Tensor],
+    decoder_name: str,
+) -> None:
+    normalized = normalize_decoder_state_dict_keys(decoder_state_dict)
+    if len(normalized) == 0:
+        raise RuntimeError(f"{decoder_name} load_state_dict strict=True failed: key_count=0")
+    preview_keys = list(normalized.keys())[:5]
+    LOGGER.info("%s key_count=%d first_keys=%s", decoder_name, len(normalized), preview_keys)
+    try:
+        decoder_module.load_state_dict(normalized, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{decoder_name} load_state_dict strict=True failed: {exc}") from exc
+
+
+def validate_router_runtime_configs(
+    classes: List[str],
+    route_map: Dict[str, str],
+    thresholds: Dict[str, float],
+    postprocess_cfg: Dict[str, Dict[str, Any]],
+) -> None:
+    missing_route = [class_name for class_name in classes if class_name not in route_map]
+    missing_threshold = [class_name for class_name in classes if class_name not in thresholds]
+    missing_post = [class_name for class_name in classes if class_name not in postprocess_cfg]
+    if missing_route or missing_threshold or missing_post:
+        raise RuntimeError(
+            "router config incomplete: "
+            f"missing_route={missing_route}, "
+            f"missing_threshold={missing_threshold}, "
+            f"missing_postprocess={missing_post}"
+        )
+
+
+def build_router_runtime(
+    model: ESAMCCLIPModel,
+    checkpoint: Dict[str, Any],
+    classes: List[str],
+    device: torch.device,
+) -> Dict[str, Any]:
+    router_enabled = bool(checkpoint.get("router_enabled", False))
+    router_info: Dict[str, Any] = {
+        "enabled": router_enabled,
+        "router_type": str(checkpoint.get("router_type", "")) if router_enabled else None,
+        "route_mode": str(checkpoint.get("route_mode", "")) if router_enabled else None,
+        "route_map": None,
+        "decoder_lite": model.decoder,
+        "decoder_stage2": None,
+        "base_model_params": None,
+        "stage2_decoder_params": 0,
+        "total_runtime_params": None,
+    }
+    if not router_enabled:
+        return router_info
+
+    route_map_raw = checkpoint.get("route_map")
+    if not isinstance(route_map_raw, dict):
+        raise RuntimeError("router_enabled=True 但 checkpoint 缺少 route_map")
+    route_map = validate_router_route_map(route_map_raw, classes)
+
+    decoder_lite = model.decoder
+    decoder_lite_state_dict = checkpoint.get("decoder_lite_state_dict")
+    if isinstance(decoder_lite_state_dict, dict):
+        load_decoder_module_state(decoder_lite, decoder_lite_state_dict, "decoder_lite")
+    decoder_stage2_state_dict = checkpoint.get("decoder_stage2_state_dict")
+    if not isinstance(decoder_stage2_state_dict, dict) or not decoder_stage2_state_dict:
+        raise RuntimeError("router_enabled=True 但 checkpoint 缺少 decoder_stage2_state_dict")
+    decoder_stage2 = copy.deepcopy(model.decoder)
+    load_decoder_module_state(decoder_stage2, decoder_stage2_state_dict, "decoder_stage2")
+
+    decoder_lite.to(device).eval()
+    decoder_stage2.to(device).eval()
+
+    base_model_state_dict = load_state_dict_flexible(checkpoint)
+    base_model_params = count_tensor_params(base_model_state_dict)
+    stage2_decoder_params = count_tensor_params(decoder_stage2_state_dict)
+    total_runtime_params = int(base_model_params + stage2_decoder_params)
+    LOGGER.info("router_enabled=%s", router_enabled)
+    LOGGER.info("router_type=%s", checkpoint.get("router_type"))
+    LOGGER.info("route_mode=%s", checkpoint.get("route_mode"))
+    LOGGER.info("route_map=%s", route_map)
+    LOGGER.info("base_model_params=%d", base_model_params)
+    LOGGER.info("stage2_decoder_params=%d", stage2_decoder_params)
+    LOGGER.info("total_runtime_params=%d", total_runtime_params)
+    if total_runtime_params > DEFAULT_ROUTER_MAX_RUNTIME_PARAMS:
+        raise RuntimeError(
+            f"router runtime params 超限: total={total_runtime_params} max={DEFAULT_ROUTER_MAX_RUNTIME_PARAMS}"
+        )
+    LOGGER.info("Router selfcheck:")
+    for class_name in classes:
+        LOGGER.info("%s -> %s", class_name, route_map.get(class_name))
+
+    router_info.update(
+        {
+            "route_map": route_map,
+            "decoder_lite": decoder_lite,
+            "decoder_stage2": decoder_stage2,
+            "base_model_params": int(base_model_params),
+            "stage2_decoder_params": int(stage2_decoder_params),
+            "total_runtime_params": int(total_runtime_params),
+        }
+    )
+    return router_info
+
+
 def map_prompt_to_known_class(prompt_text: str, prompt_aliases: Dict[str, str]) -> Optional[str]:
     return prompt_aliases.get(normalize_prompt_key(prompt_text))
 
@@ -1363,13 +1524,25 @@ def resolve_prompt_inference_config(
 ) -> Tuple[str, float, str]:
     prompt_fusion_mode = cli_prompt_fusion_mode
     if prompt_fusion_mode is None:
-        prompt_fusion_mode = DEFAULT_PROMPT_FUSION_MODE
+        prompt_fusion_mode = (
+            str(checkpoint.get("prompt_fusion_mode"))
+            if isinstance(checkpoint, dict) and checkpoint.get("prompt_fusion_mode") is not None
+            else DEFAULT_PROMPT_FUSION_MODE
+        )
     raw_prompt_weight = cli_raw_prompt_weight
     if raw_prompt_weight is None:
-        raw_prompt_weight = DEFAULT_RAW_PROMPT_WEIGHT
+        raw_prompt_weight = (
+            float(checkpoint.get("raw_prompt_weight"))
+            if isinstance(checkpoint, dict) and checkpoint.get("raw_prompt_weight") is not None
+            else DEFAULT_RAW_PROMPT_WEIGHT
+        )
     prompt_match_mode = cli_prompt_match_mode
     if prompt_match_mode is None:
-        prompt_match_mode = DEFAULT_PROMPT_MATCH_MODE
+        prompt_match_mode = (
+            str(checkpoint.get("prompt_match_mode"))
+            if isinstance(checkpoint, dict) and checkpoint.get("prompt_match_mode") is not None
+            else DEFAULT_PROMPT_MATCH_MODE
+        )
     prompt_fusion_mode = prompt_fusion_mode if prompt_fusion_mode in {"prototype", "raw", "blend"} else DEFAULT_PROMPT_FUSION_MODE
     prompt_match_mode = prompt_match_mode if prompt_match_mode in {"exact", "soft", "target_soft"} else DEFAULT_PROMPT_MATCH_MODE
     raw_prompt_weight = min(max(float(raw_prompt_weight), 0.0), 1.0)
@@ -1519,7 +1692,7 @@ def resolve_submission_resources(
     checkpoint_path: Optional[str],
     tokenizer_path: Optional[str],
     text_cache_path: Optional[str],
-) -> Tuple[str, str, str, str]:
+) -> Tuple[str, str, str, Optional[str]]:
     resolved_model_dir = resolve_path(model_dir) or model_dir
     model_dir_path = Path(resolved_model_dir)
     if not model_dir_path.exists():
@@ -1534,9 +1707,6 @@ def resolve_submission_resources(
     resolved_tokenizer = choose_tokenizer_dir(model_dir_path, tokenizer_path)
 
     resolved_cache = resolve_path(text_cache_path) if text_cache_path else None
-    if resolved_cache is None:
-        resolved_cache = str(model_dir_path / "text_emb_11.pt")
-
     return resolved_model_dir, resolved_checkpoint, resolved_tokenizer, resolved_cache
 
 
@@ -1548,6 +1718,14 @@ def resolve_checkpoint_prompt_prototypes(
     checkpoint: Dict[str, Any],
     classes: List[str],
 ) -> Dict[str, List[str]]:
+    if isinstance(checkpoint, dict):
+        ckpt_prototypes = checkpoint.get("prompt_prototypes")
+        if isinstance(ckpt_prototypes, dict):
+            missing = [class_name for class_name in classes if class_name not in ckpt_prototypes]
+            if missing:
+                raise RuntimeError(f"checkpoint prompt_prototypes 缺少类别: {missing}")
+            normalized = normalize_prompt_prototypes(ckpt_prototypes, classes)
+            return normalized
     return normalize_prompt_prototypes(DEFAULT_PROMPT_PROTOTYPES, classes)
 
 
@@ -1583,7 +1761,7 @@ def load_model(
     checkpoint_path: Optional[str] = None,
     tokenizer_path: Optional[str] = None,
     text_cache_path: Optional[str] = None,
-) -> Tuple[ESAMCCLIPModel, Any, Dict[str, Any], int, Dict[str, Any], List[str], Dict[str, str]]:
+) -> Tuple[ESAMCCLIPModel, Any, Dict[str, Any], int, Dict[str, Any], List[str], Dict[str, str], Dict[str, Any]]:
     ensure_hf_cache()
     device = resolve_device("cuda" if torch.cuda.is_available() else "cpu")
     model_dir, checkpoint_path, tokenizer_path, text_cache_path = resolve_submission_resources(
@@ -1596,6 +1774,12 @@ def load_model(
     checkpoint_preview = load_checkpoint_payload(checkpoint_path, device)
     classes = resolve_checkpoint_classes(checkpoint_preview)
     prompt_prototypes = resolve_checkpoint_prompt_prototypes(checkpoint_preview, classes)
+    prompt_prototypes_source = (
+        str(checkpoint_preview.get("prompt_prototypes_source", "default"))
+        if isinstance(checkpoint_preview, dict)
+        else "default"
+    )
+    LOGGER.info("prompt_prototypes_source=%s", prompt_prototypes_source)
     prompt_aliases = build_prompt_aliases(prompt_prototypes, classes)
 
     model = ESAMCCLIPModel(
@@ -1615,18 +1799,22 @@ def load_model(
         LOGGER.warning("checkpoint unexpected_keys=%d，前10项: %s", len(unexpected_keys), unexpected_keys[:10])
 
     tokenizer = load_tokenizer(tokenizer_path)
+    cache_path_obj = Path(text_cache_path) if text_cache_path else None
     text_cache_payload = load_or_build_text_cache(
         model=model,
         tokenizer=tokenizer,
-        cache_path=Path(text_cache_path),
+        cache_path=cache_path_obj,
         classes=classes,
         prompt_prototypes=prompt_prototypes,
         device=device,
     )
     text_cache_payload = move_text_cache_to_device(text_cache_payload, device)
+    text_cache_payload["prompt_prototypes_source"] = prompt_prototypes_source
+    text_cache_payload["cache_path"] = str(cache_path_obj) if cache_path_obj is not None else None
+    router_info = build_router_runtime(model, checkpoint, classes, device)
     model.eval()
     model_input_size = int(checkpoint.get("img_size", DEFAULT_SUBMIT_IMG_SIZE)) if isinstance(checkpoint, dict) else DEFAULT_SUBMIT_IMG_SIZE
-    return model, tokenizer, text_cache_payload, model_input_size, checkpoint, classes, prompt_aliases
+    return model, tokenizer, text_cache_payload, model_input_size, checkpoint, classes, prompt_aliases, router_info
 
 
 @torch.inference_mode()
@@ -1646,6 +1834,7 @@ def do_inference(
     prompt_fusion_mode: str = DEFAULT_PROMPT_FUSION_MODE,
     raw_prompt_weight: float = DEFAULT_RAW_PROMPT_WEIGHT,
     prompt_match_mode: str = DEFAULT_PROMPT_MATCH_MODE,
+    router_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], int, int, Dict[str, Any]]:
     device = next(model.parameters()).device
     image_tensor, meta = preprocess_image(image_path, model_input_size)
@@ -1660,6 +1849,7 @@ def do_inference(
         prompt_batch = text_prompts[start:start + PROMPT_BATCH_SIZE]
         feature_list: List[torch.Tensor] = []
         mapped_classes: List[Optional[str]] = []
+        routes: List[str] = []
         for prompt_text in prompt_batch:
             feature, mapped_class = build_text_feature_for_prompt(
                 model=model,
@@ -1675,21 +1865,50 @@ def do_inference(
             )
             feature_list.append(feature)
             mapped_classes.append(mapped_class)
+            route_map = router_info.get("route_map") if isinstance(router_info, dict) else None
+            routes.append(resolve_prompt_route(mapped_class, route_map))
 
         if not feature_list:
             continue
 
-        text_features = torch.stack(feature_list, dim=0).to(device, non_blocking=True)
-        image_batch = image_embedding.expand(text_features.size(0), -1, -1, -1)
-        logits = model.decode(
-            image_features=image_batch,
-            text_features=text_features,
-            target_size=(model_input_size, model_input_size),
-        )
-        if logits.ndim != 4 or logits.shape[1] != 1:
-            raise RuntimeError(f"logits 形状异常，期望 [B, 1, H, W]，当前: {tuple(logits.shape)}")
+        logits_by_index: List[Optional[torch.Tensor]] = [None] * len(prompt_batch)
+        router_enabled = bool(router_info and router_info.get("enabled"))
+        if router_enabled:
+            grouped_indices: Dict[str, List[int]] = {"lite": [], "stage2": []}
+            for idx, route in enumerate(routes):
+                grouped_indices.setdefault(route, []).append(idx)
+            for route_name, indices in grouped_indices.items():
+                if not indices:
+                    continue
+                route_features = torch.stack([feature_list[idx] for idx in indices], dim=0).to(device, non_blocking=True)
+                route_image_batch = image_embedding.expand(route_features.size(0), -1, -1, -1).contiguous()
+                decoder = router_info["decoder_lite"] if route_name == "lite" else router_info["decoder_stage2"]
+                route_logits = decoder(
+                    image_features=route_image_batch,
+                    text_global_features=route_features,
+                    target_size=(model_input_size, model_input_size),
+                )
+                if route_logits.ndim != 4 or route_logits.shape[1] != 1:
+                    raise RuntimeError(f"{route_name} logits 形状异常，当前: {tuple(route_logits.shape)}")
+                for local_idx, batch_idx in enumerate(indices):
+                    logits_by_index[batch_idx] = route_logits[local_idx]
+        else:
+            text_features = torch.stack(feature_list, dim=0).to(device, non_blocking=True)
+            image_batch = image_embedding.expand(text_features.size(0), -1, -1, -1).contiguous()
+            logits = model.decode(
+                image_features=image_batch,
+                text_features=text_features,
+                target_size=(model_input_size, model_input_size),
+            )
+            if logits.ndim != 4 or logits.shape[1] != 1:
+                raise RuntimeError(f"logits 形状异常，期望 [B, 1, H, W]，当前: {tuple(logits.shape)}")
+            for idx, prompt_logits in enumerate(logits):
+                logits_by_index[idx] = prompt_logits
 
-        for prompt_text, mapped_class, prompt_logits in zip(prompt_batch, mapped_classes, logits):
+        if any(prompt_logits is None for prompt_logits in logits_by_index):
+            raise RuntimeError("router decode 未能还原完整 logits 顺序")
+
+        for prompt_text, mapped_class, route_name, prompt_logits in zip(prompt_batch, mapped_classes, routes, logits_by_index):
             threshold = get_prompt_threshold(prompt_text, mapped_class, thresholds, default_mask_threshold)
             post_cfg = get_prompt_postprocess(prompt_text, mapped_class, postprocess_cfg)
             prob, score = logits_to_probability_map(prompt_logits, meta, model_input_size)
@@ -1711,6 +1930,7 @@ def do_inference(
             results_by_prompt[prompt_text] = {
                 "prompt": prompt_text,
                 "mapped_class": mapped_class,
+                "route": route_name,
                 "score": float(score),
                 "threshold": float(threshold),
                 "mask_area": int(mask.sum()),
@@ -1741,7 +1961,7 @@ def process_tasks(
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
-    model, tokenizer, text_cache_payload, model_input_size, checkpoint, classes, prompt_aliases = load_model(
+    model, tokenizer, text_cache_payload, model_input_size, checkpoint, classes, prompt_aliases, router_info = load_model(
         model_dir=model_dir,
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
@@ -1798,6 +2018,20 @@ def process_tasks(
     postprocess_cfg = checkpoint_postprocess if postprocess_json is None else json.loads(Path(postprocess_json).read_text(encoding="utf-8"))
     LOGGER.info("final threshold source=%s", threshold_source)
     LOGGER.info("final postprocess source=%s", postprocess_source)
+    route_map = router_info.get("route_map") if router_info else None
+    if router_info and router_info.get("enabled"):
+        validate_router_runtime_configs(classes, route_map or {}, thresholds, postprocess_cfg)
+    for class_name in classes:
+        post_cfg = postprocess_cfg.get(class_name, {})
+        LOGGER.info(
+            "class cfg: %s route=%s threshold=%.4f min_area=%s topk_components=%s fill_holes=%s",
+            class_name,
+            resolve_prompt_route(class_name, route_map),
+            float(thresholds.get(class_name, mask_threshold)),
+            post_cfg.get("min_area", 0),
+            post_cfg.get("topk_components"),
+            bool(post_cfg.get("fill_holes", False)),
+        )
     prompt_feature_cache: Dict[str, Tuple[torch.Tensor, Optional[str]]] = {}
 
     model_info = count_model_params(model, device)
@@ -1811,12 +2045,29 @@ def process_tasks(
     model_info["use_prompt_prototype"] = bool(text_cache_payload.get("use_prompt_prototype", True))
     model_info["text_cache_classes"] = list(text_cache_payload.get("classes", classes))
     model_info["text_cache_signature"] = text_cache_payload.get("prompt_prototypes_signature")
+    model_info["prompt_prototypes_source"] = text_cache_payload.get("prompt_prototypes_source", "default")
     model_info["prompt_fusion_mode"] = prompt_fusion_mode
     model_info["raw_prompt_weight"] = float(raw_prompt_weight)
     model_info["prompt_match_mode"] = prompt_match_mode
     model_info["threshold_source"] = threshold_source
     model_info["postprocess_source"] = postprocess_source
     model_info["rare_empty_fallback_enabled"] = bool(rare_empty_fallback)
+    model_info["router_enabled"] = bool(router_info.get("enabled")) if router_info else False
+    model_info["router_type"] = router_info.get("router_type") if router_info else None
+    model_info["route_mode"] = router_info.get("route_mode") if router_info else None
+    model_info["route_map"] = route_map
+    model_info["base_model_params"] = router_info.get("base_model_params") if router_info else None
+    model_info["stage2_decoder_params"] = router_info.get("stage2_decoder_params") if router_info else None
+    model_info["total_runtime_params"] = router_info.get("total_runtime_params") if router_info else None
+    model_info["thresholds"] = {key: float(value) for key, value in sorted(thresholds.items())}
+    model_info["postprocess_cfg"] = {
+        key: {
+            "min_area": int(value.get("min_area", 0)),
+            "fill_holes": bool(value.get("fill_holes", False)),
+            **({"topk_components": int(value.get("topk_components", 0))} if value.get("topk_components") is not None else {}),
+        }
+        for key, value in sorted(postprocess_cfg.items())
+    }
     if isinstance(checkpoint, dict):
         for key in ["epoch", "run_name", "model_type", "val_thresholds", "prompt_thresholds", "sweep_mode", "sweep_metric"]:
             if key in checkpoint:
@@ -1864,6 +2115,7 @@ def process_tasks(
                 prompt_fusion_mode=prompt_fusion_mode,
                 raw_prompt_weight=raw_prompt_weight,
                 prompt_match_mode=prompt_match_mode,
+                router_info=router_info,
             )
             fallback_hit_count += int(image_debug_stats.get("fallback_hit_count", 0))
             for class_name, hit_count in image_debug_stats.get("fallback_by_class", {}).items():

@@ -254,16 +254,58 @@ STAGE2_SUBMIT_RARE_POST = {
     "motorcycle": {"min_area": 8, "topk_components": None},
 }
 
+STAGE2_REFINE_OLD_THRESH_GRID = {
+    "person": [0.43, 0.44, 0.45, 0.46, 0.47],
+    "car": [0.48, 0.49, 0.50, 0.51, 0.52],
+    "building": [0.43, 0.44, 0.45, 0.46, 0.47],
+    "tree": [0.38, 0.39, 0.40, 0.41, 0.42],
+    "animal": [0.28, 0.29, 0.30, 0.31, 0.32],
+}
+
+STAGE2_REFINE_RARE_THRESH_GRID = {
+    "trash can": [0.25, 0.27, 0.30, 0.32, 0.35],
+    "window": [0.33, 0.35, 0.38, 0.40, 0.43],
+    "door": [0.27, 0.30, 0.32, 0.35, 0.37],
+    "fence": [0.25, 0.27, 0.30, 0.32, 0.35],
+    "pole_light": [0.20, 0.22, 0.25, 0.28, 0.30],
+    "motorcycle": [0.35, 0.37, 0.40, 0.42, 0.45],
+}
+
+STAGE2_REFINE_OLD_MIN_AREA_GRID = {
+    "person": [16, 24, 32],
+    "car": [32, 48, 64],
+    "building": [96, 128, 160],
+    "tree": [128, 160],
+    "animal": [16, 24, 32],
+}
+
+STAGE2_REFINE_RARE_MIN_AREA_GRID = {
+    "trash can": [4, 8],
+    "window": [4, 8, 12],
+    "door": [12, 16],
+    "fence": [2, 4],
+    "pole_light": [2, 4],
+    "motorcycle": [8, 12],
+}
+
+STAGE2_REFINE_RARE_TOPK_GRID = {
+    "window": [None, 2],
+    "fence": [3, 5],
+    "pole_light": [None, 2],
+}
+
 
 def canonicalize_sweep_mode(sweep_mode: str) -> str:
     if sweep_mode == "safe":
         return "best"
+    if sweep_mode in {"stage2_submit_refine", "submit_stage2_refine"}:
+        return "stage2_refine"
     return sweep_mode
 
 
 def resolve_prompt_prototypes_for_sweep(sweep_mode: str) -> Dict[str, List[str]]:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
-    if sweep_mode == "stage2_submit_safe":
+    if sweep_mode in {"stage2_submit_safe", "stage2_refine"}:
         return SUBMIT_CLEAN_PROMPT_PROTOTYPES
     return PROMPT_PROTOTYPES
 
@@ -272,6 +314,14 @@ def resolve_threshold_grid(sweep_mode: str) -> dict:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
     if sweep_mode == "best":
         return BEST_THRESH_GRID
+    if sweep_mode == "stage2_refine":
+        grid = {}
+        for class_name in CLASSES:
+            if class_name in OLD_CLASSES:
+                grid[class_name] = STAGE2_REFINE_OLD_THRESH_GRID[class_name]
+            else:
+                grid[class_name] = STAGE2_REFINE_RARE_THRESH_GRID[class_name]
+        return grid
     if sweep_mode == "stage2_submit_safe":
         grid = {}
         for class_name in CLASSES:
@@ -307,6 +357,14 @@ def resolve_min_area_grid(sweep_mode: str) -> dict:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
     if sweep_mode == "best":
         return BEST_MIN_AREA_GRID
+    if sweep_mode == "stage2_refine":
+        grid = {}
+        for class_name in CLASSES:
+            if class_name in OLD_CLASSES:
+                grid[class_name] = STAGE2_REFINE_OLD_MIN_AREA_GRID[class_name]
+            else:
+                grid[class_name] = STAGE2_REFINE_RARE_MIN_AREA_GRID[class_name]
+        return grid
     if sweep_mode == "stage2_submit_safe":
         grid = {}
         for class_name in CLASSES:
@@ -338,6 +396,8 @@ def resolve_min_area_grid(sweep_mode: str) -> dict:
 
 def resolve_default_output_dir(sweep_mode: str) -> Path:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
+    if sweep_mode == "stage2_refine":
+        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_stage2_refine"
     if sweep_mode == "stage2_submit_safe":
         return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_stage2_submit_safe"
     if sweep_mode == "fine_recall":
@@ -353,6 +413,8 @@ def resolve_default_output_dir(sweep_mode: str) -> Path:
 
 def resolve_default_write_back_path(sweep_mode: str) -> Path:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
+    if sweep_mode == "stage2_refine":
+        return ROOT / "model" / "submit-rsam-stage2-refine" / "sam3.pt"
     if sweep_mode == "stage2_submit_safe":
         return ROOT / "model" / "submit-rsam-stage2-safe" / "sam3.pt"
     if sweep_mode == "fine_recall":
@@ -839,6 +901,12 @@ def default_cfg_for_class(class_name: str, threshold_grid: dict, min_area_grid: 
 
 def resolve_topk_grid(class_name: str, sweep_mode: Optional[str] = None):
     sweep_mode = canonicalize_sweep_mode(sweep_mode) if sweep_mode is not None else None
+    if sweep_mode == "stage2_refine":
+        if class_name in OLD_CLASSES:
+            return [None]
+        if class_name in STAGE2_REFINE_RARE_TOPK_GRID:
+            return STAGE2_REFINE_RARE_TOPK_GRID[class_name]
+        return [STAGE2_SUBMIT_RARE_POST[class_name]["topk_components"]]
     if sweep_mode == "stage2_submit_safe":
         if class_name in OLD_CLASSES:
             return [None]
@@ -944,6 +1012,15 @@ def build_sweep_summary_lines(
         lines.append(f"stage2 old threshold grid: {json.dumps(STAGE2_SUBMIT_OLD_THRESH_GRID, ensure_ascii=False)}")
         lines.append(f"stage2 rare threshold grid: {json.dumps(STAGE2_SUBMIT_RARE_THRESH_GRID, ensure_ascii=False)}")
         lines.append(f"stage2 rare post cfg: {json.dumps(STAGE2_SUBMIT_RARE_POST, ensure_ascii=False)}")
+    if sweep_mode == "stage2_refine":
+        lines.append("stage2 refine mode")
+        lines.append("old classes threshold local search within +/-0.02")
+        lines.append("rare classes threshold local search within +/-0.03~0.05")
+        lines.append(f"stage2 refine old threshold grid: {json.dumps(STAGE2_REFINE_OLD_THRESH_GRID, ensure_ascii=False)}")
+        lines.append(f"stage2 refine rare threshold grid: {json.dumps(STAGE2_REFINE_RARE_THRESH_GRID, ensure_ascii=False)}")
+        lines.append(f"stage2 refine old min_area grid: {json.dumps(STAGE2_REFINE_OLD_MIN_AREA_GRID, ensure_ascii=False)}")
+        lines.append(f"stage2 refine rare min_area grid: {json.dumps(STAGE2_REFINE_RARE_MIN_AREA_GRID, ensure_ascii=False)}")
+        lines.append(f"stage2 refine rare topk grid: {json.dumps(STAGE2_REFINE_RARE_TOPK_GRID, ensure_ascii=False)}")
     if sweep_mode == "hybrid_safe":
         lines.append("old classes are fixed")
         lines.append("rare classes threshold-only conservative sweep")
@@ -1038,7 +1115,7 @@ def main():
     parser.add_argument("--text_cache_path", type=Path, default=DEFAULT_TEXT_CACHE_PATH)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE if DEFAULT_DEVICE else ("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--sweep_mode", choices=["best", "safe", "recall", "fine_recall", "hybrid", "hybrid_safe", "stage2_submit_safe"], default=DEFAULT_SWEEP_MODE)
+    parser.add_argument("--sweep_mode", choices=["best", "safe", "recall", "fine_recall", "hybrid", "hybrid_safe", "stage2_submit_safe", "stage2_refine", "stage2_submit_refine", "submit_stage2_refine"], default=DEFAULT_SWEEP_MODE)
     parser.add_argument("--write_back_checkpoint", dest="write_back_checkpoint", action="store_true")
     parser.add_argument("--no_write_back_checkpoint", dest="write_back_checkpoint", action="store_false")
     parser.add_argument("--write_back_path", type=Path, default=None)
@@ -1061,8 +1138,8 @@ def main():
         LOGGER.warning("sweep_mode=safe is deprecated and now maps to sweep_mode=best")
 
     active_prompt_prototypes = resolve_prompt_prototypes_for_sweep(args.sweep_mode)
-    prompt_prototypes_source = "submit_clean" if args.sweep_mode == "stage2_submit_safe" else "config"
-    if args.sweep_mode == "stage2_submit_safe" and args.text_cache_path == DEFAULT_TEXT_CACHE_PATH:
+    prompt_prototypes_source = "submit_clean" if args.sweep_mode in {"stage2_submit_safe", "stage2_refine"} else "config"
+    if args.sweep_mode in {"stage2_submit_safe", "stage2_refine"} and args.text_cache_path == DEFAULT_TEXT_CACHE_PATH:
         args.text_cache_path = Path(DEFAULT_TEXT_CACHE_PATH).with_name("text_emb_11_submit_clean.pt")
 
     args.output_dir = args.output_dir or resolve_default_output_dir(args.sweep_mode)
@@ -1121,7 +1198,7 @@ def main():
         for class_name, embedding in text_cache_payload["embeddings"].items()
     }
     prompt_aliases = build_prompt_aliases(active_prompt_prototypes, CLASSES)
-    if args.sweep_mode == "stage2_submit_safe":
+    if args.sweep_mode in {"stage2_submit_safe", "stage2_refine"}:
         for prompt_text in ["草丛里的车", "被树遮挡的车", "远处的小车", "建筑上的窗户", "路边的垃圾桶", "路边的灯杆"]:
             LOGGER.info(
                 "submit_clean alias selfcheck: %s -> %s",

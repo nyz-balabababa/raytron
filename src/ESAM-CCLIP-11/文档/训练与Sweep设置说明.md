@@ -507,6 +507,16 @@
 - `fine_recall`
 - `hybrid`
 - `hybrid_safe`
+- `stage2_submit_safe`
+- `stage2_refine`
+
+其中当前和提交最相关的几类规则可以先这样记：
+
+- `best`：偏 old 稳定的默认基线
+- `hybrid`：old 走 `best`，rare 走 `fine_recall`
+- `hybrid_safe`：更保守的 hybrid，old 固定、rare 只做有限搜索
+- `stage2_submit_safe`：提交型规则，统一切到 `submit_clean` prompt prototypes，并固定 `prototype + exact + raw_prompt_weight=0.0`
+- `stage2_refine`：在 `stage2_submit_safe` 基础上，把阈值和 postprocess 做更细一轮局部微调
 
 ### `best`
 
@@ -605,6 +615,109 @@ rare 固定 postprocess：
 - 路线二 fullset 权重
 - 怀疑 rare 阈值过低导致官方测试假阳性偏多时
 
+### `stage2_submit_safe`
+
+说明：
+
+- 面向提交链路的保守 sweep。
+- 会自动切到 `submit_clean` prompt prototypes。
+- 默认搭配：
+  - `prompt_fusion_mode=prototype`
+  - `raw_prompt_weight=0.0`
+  - `prompt_match_mode=exact`
+
+old 阈值网格：
+
+- `person`: `[0.43, 0.45, 0.47]`
+- `car`: `[0.48, 0.50, 0.52]`
+- `building`: `[0.42, 0.45, 0.48]`
+- `tree`: `[0.38, 0.40, 0.42]`
+- `animal`: `[0.28, 0.30, 0.32]`
+
+rare 阈值网格：
+
+- `trash can`: `[0.27, 0.30, 0.32]`
+- `window`: `[0.35, 0.38, 0.40]`
+- `door`: `[0.30, 0.32, 0.35]`
+- `fence`: `[0.27, 0.30, 0.32]`
+- `pole_light`: `[0.22, 0.25, 0.28]`
+- `motorcycle`: `[0.37, 0.40, 0.42]`
+
+old `min_area` 网格：
+
+- `person`: `[16, 24]`
+- `car`: `[32, 64]`
+- `building`: `[128]`
+- `tree`: `[128, 160]`
+- `animal`: `[16, 24, 32]`
+
+rare 固定 postprocess：
+
+- `trash can`: `min_area=8`
+- `window`: `min_area=8`
+- `door`: `min_area=16`
+- `fence`: `min_area=4`, `topk_components=3`
+- `pole_light`: `min_area=4`
+- `motorcycle`: `min_area=8`
+
+适合：
+
+- 想把 sweep 结果直接往提交配置靠拢
+- 想避免文本别名和外部 cache 口径带来额外不稳定性
+
+### `stage2_refine`
+
+说明：
+
+- 是 `stage2_submit_safe` 的细化版。
+- 同样使用 `submit_clean` prompt prototypes 和 `prototype + exact` 规则。
+- 但 old/rare 都会再做更细一轮局部搜索。
+
+old 阈值网格：
+
+- `person`: `[0.43, 0.44, 0.45, 0.46, 0.47]`
+- `car`: `[0.48, 0.49, 0.50, 0.51, 0.52]`
+- `building`: `[0.43, 0.44, 0.45, 0.46, 0.47]`
+- `tree`: `[0.38, 0.39, 0.40, 0.41, 0.42]`
+- `animal`: `[0.28, 0.29, 0.30, 0.31, 0.32]`
+
+rare 阈值网格：
+
+- `trash can`: `[0.25, 0.27, 0.30, 0.32, 0.35]`
+- `window`: `[0.33, 0.35, 0.38, 0.40, 0.43]`
+- `door`: `[0.27, 0.30, 0.32, 0.35, 0.37]`
+- `fence`: `[0.25, 0.27, 0.30, 0.32, 0.35]`
+- `pole_light`: `[0.20, 0.22, 0.25, 0.28, 0.30]`
+- `motorcycle`: `[0.35, 0.37, 0.40, 0.42, 0.45]`
+
+old `min_area` 网格：
+
+- `person`: `[16, 24, 32]`
+- `car`: `[32, 48, 64]`
+- `building`: `[96, 128, 160]`
+- `tree`: `[128, 160]`
+- `animal`: `[16, 24, 32]`
+
+rare `min_area` 网格：
+
+- `trash can`: `[4, 8]`
+- `window`: `[4, 8, 12]`
+- `door`: `[12, 16]`
+- `fence`: `[2, 4]`
+- `pole_light`: `[2, 4]`
+- `motorcycle`: `[8, 12]`
+
+rare `topk_components` 细扫：
+
+- `window`: `[None, 2]`
+- `fence`: `[3, 5]`
+- `pole_light`: `[None, 2]`
+
+适合：
+
+- 已经有一版 `stage2_submit_safe`，想再做局部补扫
+- 想确认 stage2 底座是不是输在阈值细节，而不是输在权重本身
+
 ## 8. 当前 sweep 输出内容
 
 输出目录里一般会有：
@@ -640,6 +753,13 @@ rare 固定 postprocess：
 - `fixed old cfg`
 - `rare threshold grid`
 
+`stage2_submit_safe / stage2_refine` 额外会记录：
+
+- `prompt_prototypes_source=submit_clean`
+- `prompt_fusion_mode=prototype`
+- `raw_prompt_weight=0.0`
+- `prompt_match_mode=exact`
+
 ## 9. 现在怎么选 train 和 sweep
 
 当前实操建议：
@@ -661,6 +781,39 @@ rare 固定 postprocess：
 - `hybrid` 更适合“old 不想掉、rare 还想补”
 - `fine_recall` 更像 rare 冲分线
 - `hybrid_safe` 更像保守 hedge 版本
+- `stage2_submit_safe` 更像直接贴近提交口径的保守扫法
+- `stage2_refine` 更像在提交口径上做局部精修
+
+### 9.1 本轮新增 sweep 结果补充
+
+这次新增、且你最近反复对比的重点结果如下：
+
+- `threshold_sweep_esam_11_lite_stage2_submit`
+  - 扫描对象：`ESAM-CCLIP-11-old-balanced/final_fullset.pt`
+  - 使用规则：`stage2_submit_safe`
+  - 结果：`best_metric=0.578766`
+  - 备注：当前本地最强 lite sweep
+- `threshold_sweep_esam_11_hybrid_lite`
+  - 扫描对象：`ESAM-CCLIP-11-old-balanced/final_fullset.pt`
+  - 使用规则：`hybrid`
+  - 结果：`best_metric=0.578131`
+  - 备注：比 `lite_stage2_submit` 低 `0.000635`
+- `threshold_sweep_esam_11_stage2_submit`
+  - 扫描对象：`ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt`
+  - 使用规则：`stage2_submit_safe`
+  - 结果：`best_metric=0.556997`
+  - 备注：stage2 提交基线
+- `threshold_sweep_esam_11_stage2_refine`
+  - 扫描对象：`ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt`
+  - 使用规则：`stage2_refine`
+  - 结果：`best_metric=0.557326`
+  - 备注：比 `stage2_submit` 高 `0.000329`
+
+当前可以直接记成三条结论：
+
+- 对 lite 底座，`stage2_submit_safe` 已经略强于 `hybrid`
+- 对 stage2 底座，`refine` 只比 `submit_safe` 小幅提升
+- 但 stage2 底座整体仍低于 lite 底座
 
 ## 10. 推荐命令入口
 
