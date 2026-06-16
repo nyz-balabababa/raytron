@@ -72,7 +72,7 @@ class ESAMCCLIP11Dataset(Dataset):
         self.use_conf_filter = use_conf_filter
         self.negative_sample_prob = negative_sample_prob
         self.negative_sample_weight = negative_sample_weight
-        self.rare_oversample = rare_oversample or {}
+        self.rare_oversample = rare_oversample if rare_oversample is not None else {}
         self.old_class_sample_ratio = float(old_class_sample_ratio)
         self.rare_class_keep_ratio = float(rare_class_keep_ratio)
         self.old_classes = set(old_classes or RARE_BALANCED_OLD_CLASSES)
@@ -133,6 +133,16 @@ class ESAMCCLIP11Dataset(Dataset):
         if prompt in self.rare_classes:
             return self.rng.random() < self.rare_class_keep_ratio
         return True
+
+    def _resolve_rare_oversample_factor(self, prompt: str) -> float:
+        if prompt not in self.rare_classes:
+            return 1.0
+        oversample = self.rare_oversample
+        if isinstance(oversample, dict):
+            return float(oversample.get(prompt, 1.0))
+        if isinstance(oversample, (int, float)):
+            return float(oversample)
+        return 1.0
 
     def _build_samples(self):
         with open(self.annotation_json, "r", encoding="utf-8-sig") as file_obj:
@@ -229,6 +239,8 @@ class ESAMCCLIP11Dataset(Dataset):
             "old_class_sample_ratio": self.old_class_sample_ratio,
             "rare_class_keep_ratio": self.rare_class_keep_ratio,
             "rare_balance_enabled": self.rare_balance_enabled,
+            "rare_oversample_factor": self.rare_oversample,
+            "rare_oversample_extra_count": 0,
         }
         positives = [sample for sample in base_samples if sample["is_positive"]]
         negatives = [sample for sample in base_samples if not sample["is_positive"]]
@@ -247,9 +259,16 @@ class ESAMCCLIP11Dataset(Dataset):
         if self.rare_oversample:
             extra = []
             for sample in kept_positives:
-                mult = int(self.rare_oversample.get(sample["prompt"], 1))
-                for _ in range(max(mult - 1, 0)):
+                factor = self._resolve_rare_oversample_factor(sample["prompt"])
+                if factor <= 1.0:
+                    continue
+                integer_part = int(np.floor(factor))
+                base_extra = max(integer_part - 1, 0)
+                frac = max(factor - integer_part, 0.0)
+                repeat_count = base_extra + (1 if frac > 0 and self.rng.random() < frac else 0)
+                for _ in range(repeat_count):
                     extra.append(sample.copy())
+                rebalance_stats["rare_oversample_extra_count"] += repeat_count
             base_samples.extend(extra)
 
         class_pos_counter = Counter(sample["prompt"] for sample in base_samples if sample["is_positive"])

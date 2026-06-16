@@ -650,6 +650,7 @@ PRESET_CONFIGS = {
         "rare_oversample_factor": 1.2,
         "old_class_sample_ratio": 0.95,
         "rare_class_keep_ratio": 1.0,
+        "rare_balance_enabled": True,
         "class_weights": dict(URF_BALANCED_CLASS_WEIGHTS),
         "grad_clip": 1.0,
         "text_cache_path": CACHE_ROOT / "text_emb_11_urf_partial_unfreeze_balanced_safe.pt",
@@ -679,6 +680,7 @@ PRESET_CONFIGS = {
         "rare_oversample_factor": 1.0,
         "old_class_sample_ratio": 1.0,
         "rare_class_keep_ratio": 1.0,
+        "rare_balance_enabled": False,
         "class_weights": dict(URF_BALANCED_CLASS_WEIGHTS),
         "text_cache_path": CACHE_ROOT / "text_emb_11_urf_balanced_recalibrate.pt",
     },
@@ -708,6 +710,7 @@ PRESET_CONFIGS = {
         "rare_oversample_factor": 1.0,
         "old_class_sample_ratio": 1.0,
         "rare_class_keep_ratio": 1.0,
+        "rare_balance_enabled": False,
         "class_weights": dict(URF_BALANCED_CLASS_WEIGHTS),
         "text_cache_path": CACHE_ROOT / "text_emb_11_urf_zero_init_refine.pt",
     },
@@ -737,6 +740,7 @@ PRESET_CONFIGS = {
         "rare_oversample_factor": 1.0,
         "old_class_sample_ratio": 1.0,
         "rare_class_keep_ratio": 1.0,
+        "rare_balance_enabled": False,
         "class_weights": dict(URF_BALANCED_CLASS_WEIGHTS),
         "text_cache_path": CACHE_ROOT / "text_emb_11_urf_balanced_recalibrate_refine.pt",
     },
@@ -908,15 +912,18 @@ def _normalize_rare_oversample_value(value):
     if value is None:
         return dict(RARE_OVERSAMPLE)
     if isinstance(value, dict):
-        return dict(value)
+        normalized = {}
+        for key, raw_factor in value.items():
+            mapped_key = canonicalize_class_name(key)
+            factor = float(raw_factor)
+            if factor > 1.0:
+                normalized[mapped_key] = factor
+        return normalized
     if isinstance(value, (int, float)):
         factor = float(value)
         if factor <= 1.0:
-            return {}
-        # 当前训练代码的 dataset 只支持按整数倍复制样本。
-        # 对 1.1/1.2 这类“轻量 rare 参与”，这里保留配置语义，
-        # 实际 oversample 仍保持中性，由 class_weights / sample_ratio 主导。
-        return {}
+            return 1.0
+        return factor
     return dict(value)
 
 

@@ -245,6 +245,9 @@ class ZeroInitResidualRefineHead(torch.nn.Module):
                 align_corners=False,
             )
         gray = images.mean(dim=1, keepdim=True)
+        gray_min = gray.amin(dim=(-2, -1), keepdim=True)
+        gray_max = gray.amax(dim=(-2, -1), keepdim=True)
+        gray = (gray - gray_min) / (gray_max - gray_min).clamp_min(1e-6)
         coarse_prob = torch.sigmoid(coarse_logits)
         refine_input = torch.cat([gray, coarse_logits, coarse_prob], dim=1)
         hidden = self.act1(self.conv1(refine_input))

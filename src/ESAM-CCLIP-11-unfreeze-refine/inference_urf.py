@@ -1115,11 +1115,31 @@ class ZeroInitResidualRefineHead(torch.nn.Module):
         if images.shape[-2:] != coarse_logits.shape[-2:]:
             images = F.interpolate(images, size=coarse_logits.shape[-2:], mode="bilinear", align_corners=False)
         gray = images.mean(dim=1, keepdim=True)
+        gray_min = gray.amin(dim=(-2, -1), keepdim=True)
+        gray_max = gray.amax(dim=(-2, -1), keepdim=True)
+        gray = (gray - gray_min) / (gray_max - gray_min).clamp_min(1e-6)
         coarse_prob = torch.sigmoid(coarse_logits)
         refine_input = torch.cat([gray, coarse_logits, coarse_prob], dim=1)
         hidden = self.act1(self.conv1(refine_input))
         hidden = self.act2(self.conv2(hidden))
         return self.out(hidden)
+
+
+def validate_refine_head_structure(model: torch.nn.Module) -> Dict[str, Any]:
+    refine_head = getattr(model, "refine_head", None)
+    if refine_head is None:
+        raise RuntimeError("model 缺少 refine_head。")
+    if getattr(refine_head.conv1, "in_channels", None) != 3:
+        raise RuntimeError(f"refine_head.conv1.in_channels 必须为 3，当前={refine_head.conv1.in_channels}")
+    if int(torch.count_nonzero(refine_head.out.weight.detach()).item()) != 0:
+        raise RuntimeError("refine_head.out.weight 不是 zero-init。")
+    if int(torch.count_nonzero(refine_head.out.bias.detach()).item()) != 0:
+        raise RuntimeError("refine_head.out.bias 不是 zero-init。")
+    return {
+        "conv1_in_channels": int(refine_head.conv1.in_channels),
+        "out_weight_all_zero": True,
+        "out_bias_all_zero": True,
+    }
 
 
 class ESAMCCLIPModel(torch.nn.Module):
@@ -1137,6 +1157,7 @@ class ESAMCCLIPModel(torch.nn.Module):
         self.decoder = FiLMFusionDecoder(image_dim=256, text_dim=768)
         self.refine_head = ZeroInitResidualRefineHead(hidden_dim=refine_head_hidden_dim)
         self.use_refine_head = bool(use_refine_head)
+        self._refine_head_structure_info = validate_refine_head_structure(self)
         if freeze_text:
             for param in self.txt_encoder.parameters():
                 param.requires_grad = False
@@ -1223,9 +1244,11 @@ def load_checkpoint_flexible(
     state_dict = load_state_dict_flexible(checkpoint)
     model_state = model.state_dict()
     matched_state: Dict[str, torch.Tensor] = {}
+    matched_keys: List[str] = []
     decoder_matched_keys: List[str] = []
     refine_head_matched_keys: List[str] = []
     unexpected_keys: List[str] = []
+    shape_mismatch_keys: List[str] = []
 
     for raw_key, value in state_dict.items():
         mapped_key = remap_key(raw_key)
@@ -1233,20 +1256,51 @@ def load_checkpoint_flexible(
             unexpected_keys.append(mapped_key)
             continue
         if model_state[mapped_key].shape != value.shape:
-            unexpected_keys.append(
+            shape_mismatch_keys.append(
                 f"{mapped_key}: ckpt={tuple(value.shape)} model={tuple(model_state[mapped_key].shape)}"
             )
             continue
         matched_state[mapped_key] = value
+        matched_keys.append(mapped_key)
         if mapped_key.startswith("decoder."):
             decoder_matched_keys.append(mapped_key)
         elif mapped_key.startswith("refine_head."):
             refine_head_matched_keys.append(mapped_key)
 
     missing_keys = [key for key in model_state.keys() if key not in matched_state]
+    unexpected_keys.extend(shape_mismatch_keys)
+    checkpoint_use_refine_head = bool(checkpoint.get("use_refine_head", False))
+    checkpoint_has_refine_keys = any(remap_key(str(raw_key)).startswith("refine_head.") for raw_key in state_dict.keys())
+    checkpoint_claims_refine = bool(checkpoint_use_refine_head or checkpoint_has_refine_keys)
+    refine_shape_mismatch_keys = [key for key in shape_mismatch_keys if key.startswith("refine_head.")]
+    missing_refine_keys = [key for key in missing_keys if key.startswith("refine_head.")]
+    model_use_refine_head = bool(getattr(model, "use_refine_head", False))
     if len(decoder_matched_keys) == 0:
         raise RuntimeError("decoder_matched_keys=0，说明 decoder 没有成功加载，不能提交")
+    if checkpoint_claims_refine:
+        if len(refine_head_matched_keys) == 0:
+            raise RuntimeError("checkpoint 声明/包含 refine_head，但推理时 refine_head_matched_keys=0，拒绝提交")
+        if refine_shape_mismatch_keys:
+            raise RuntimeError(
+                "checkpoint refine_head 形状不匹配，拒绝提交: "
+                f"{refine_shape_mismatch_keys[:10]}"
+            )
     model.load_state_dict(matched_state, strict=False)
+    model._last_checkpoint_load_info = {
+        "checkpoint_path": str(checkpoint_path),
+        "matched_keys": matched_keys,
+        "decoder_matched_keys": decoder_matched_keys,
+        "refine_head_matched_keys": refine_head_matched_keys,
+        "missing_keys": missing_keys,
+        "missing_refine_keys": missing_refine_keys,
+        "unexpected_keys": unexpected_keys,
+        "shape_mismatch_keys": shape_mismatch_keys,
+        "refine_shape_mismatch_keys": refine_shape_mismatch_keys,
+        "checkpoint_use_refine_head": checkpoint_use_refine_head,
+        "checkpoint_has_refine_keys": checkpoint_has_refine_keys,
+        "checkpoint_claims_refine": checkpoint_claims_refine,
+        "model_use_refine_head": model_use_refine_head,
+    }
     LOGGER.info("checkpoint loaded: %s", checkpoint_path)
     LOGGER.info(
         "matched_keys=%d decoder_matched_keys=%d refine_head_matched_keys=%d missing_keys=%d unexpected_keys=%d",
@@ -1256,6 +1310,19 @@ def load_checkpoint_flexible(
         len(missing_keys),
         len(unexpected_keys),
     )
+    LOGGER.info(
+        "checkpoint_use_refine_head=%s model_use_refine_head=%s refine_head_matched_count=%d refine_shape_mismatch_count=%d",
+        checkpoint_use_refine_head,
+        model_use_refine_head,
+        len(refine_head_matched_keys),
+        len(refine_shape_mismatch_keys),
+    )
+    if not checkpoint_claims_refine and missing_refine_keys and model_use_refine_head:
+        LOGGER.info("old checkpoint has no refine_head, keep zero-init refine_head")
+    if missing_refine_keys:
+        LOGGER.info("missing_refine_keys_preview=%s", missing_refine_keys[:20])
+    if refine_shape_mismatch_keys:
+        LOGGER.info("refine_shape_mismatch_keys_preview=%s", refine_shape_mismatch_keys[:20])
     return checkpoint, missing_keys, unexpected_keys
 
 

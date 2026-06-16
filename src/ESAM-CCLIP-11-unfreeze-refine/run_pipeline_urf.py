@@ -68,6 +68,7 @@ def make_unique_pipeline_root(output_root: Path, pipeline_name: str, dry_run: bo
 
 def build_stage_command(
     python_exe: str,
+    pipeline_label: str,
     stage_spec: dict,
     resume_path: Path,
     stage_output_dir: Path,
@@ -88,6 +89,10 @@ def build_stage_command(
         "--output_dir",
         str(stage_output_dir),
         "--run_name",
+        stage_name,
+        "--pipeline_name",
+        pipeline_label,
+        "--pipeline_stage",
         stage_name,
     ]
     if device:
@@ -152,12 +157,14 @@ def main() -> None:
     print(f"[PipelineRoot] {pipeline_root}")
 
     current_resume = base_ckpt
+    pipeline_label = "A" if args.pipeline == "unfreeze_then_refine" else "B"
     for index, stage_spec in enumerate(stage_specs, start=1):
         stage_name = stage_spec["stage_name"]
         stage_output_dir = pipeline_root / stage_name
         stage_run_dir = resolve_stage_run_dir(stage_output_dir, stage_name)
         command = build_stage_command(
             python_exe=args.python,
+            pipeline_label=pipeline_label,
             stage_spec=stage_spec,
             resume_path=current_resume,
             stage_output_dir=stage_output_dir,

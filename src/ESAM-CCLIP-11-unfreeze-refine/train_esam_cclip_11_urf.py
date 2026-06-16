@@ -371,6 +371,7 @@ def build_argparser():
     parser.add_argument("--decoder_lr", type=float, default=DECODER_LR)
     parser.add_argument("--image_lr", type=float, default=IMAGE_LR)
     parser.add_argument("--text_lr", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=GRAD_CLIP)
     parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--warmup_epochs", type=int, default=WARMUP_EPOCHS)
     parser.add_argument("--min_lr_ratio", type=float, default=MIN_LR_RATIO)
@@ -839,7 +840,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion_dice, criteri
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
         scaler.step(optimizer)
         scaler.update()
         if scheduler is not None:
@@ -1101,6 +1102,7 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "run_name": args.run_name,
         "unfreeze_image_mode": args.unfreeze_image_mode,
         "image_lr": float(args.image_lr),
+        "grad_clip": float(args.grad_clip),
         "use_refine_head": bool(args.use_refine_head),
         "train_refine_head": bool(args.train_refine_head),
         "refine_lr": float(args.refine_lr),
@@ -1247,6 +1249,7 @@ def main():
     )
     LOGGER.info("warmup_epochs=%s", args.warmup_epochs)
     LOGGER.info("min_lr_ratio=%s", args.min_lr_ratio)
+    LOGGER.info("grad_clip=%s", args.grad_clip)
     LOGGER.info("current classes=%s", CLASSES)
     LOGGER.info("negative_sample_ratio=%s", args.negative_sample_ratio)
     LOGGER.info("negative_sample_weight=%s", args.negative_sample_weight)

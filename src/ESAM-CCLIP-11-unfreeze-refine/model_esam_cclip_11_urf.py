@@ -58,10 +58,10 @@ class ZeroInitResidualRefineHead(torch.nn.Module):
     def __init__(self, hidden_dim: int = 16):
         super().__init__()
         hidden_dim = max(int(hidden_dim), 4)
-        self.conv1 = torch.nn.Conv2d(2, hidden_dim, kernel_size=3, padding=1)
-        self.act1 = torch.nn.ReLU(inplace=True)
+        self.conv1 = torch.nn.Conv2d(3, hidden_dim, kernel_size=3, padding=1)
+        self.act1 = torch.nn.GELU()
         self.conv2 = torch.nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.act2 = torch.nn.ReLU(inplace=True)
+        self.act2 = torch.nn.GELU()
         self.out = torch.nn.Conv2d(hidden_dim, 1, kernel_size=1)
 
         torch.nn.init.kaiming_normal_(self.conv1.weight, nonlinearity="relu")
@@ -77,10 +77,28 @@ class ZeroInitResidualRefineHead(torch.nn.Module):
                 "refine head expects BCHW tensors, "
                 f"got coarse={tuple(coarse_logit_up.shape)} gray={tuple(gray_image.shape)}"
             )
-        refine_input = torch.cat([coarse_logit_up, gray_image], dim=1)
+        coarse_prob = torch.sigmoid(coarse_logit_up)
+        refine_input = torch.cat([gray_image, coarse_logit_up, coarse_prob], dim=1)
         hidden = self.act1(self.conv1(refine_input))
         hidden = self.act2(self.conv2(hidden))
         return self.out(hidden)
+
+
+def validate_refine_head_structure(model: torch.nn.Module) -> Dict[str, Any]:
+    refine_head = getattr(model, "refine_head", None)
+    if refine_head is None:
+        raise RuntimeError("model 缺少 refine_head。")
+    if getattr(refine_head.conv1, "in_channels", None) != 3:
+        raise RuntimeError(f"refine_head.conv1.in_channels 必须为 3，当前={refine_head.conv1.in_channels}")
+    if int(torch.count_nonzero(refine_head.out.weight.detach()).item()) != 0:
+        raise RuntimeError("refine_head.out.weight 不是 zero-init。")
+    if int(torch.count_nonzero(refine_head.out.bias.detach()).item()) != 0:
+        raise RuntimeError("refine_head.out.bias 不是 zero-init。")
+    return {
+        "conv1_in_channels": int(refine_head.conv1.in_channels),
+        "out_weight_all_zero": True,
+        "out_bias_all_zero": True,
+    }
 
 
 class ESAMCCLIPModel(_BaseESAMCCLIPModel):
@@ -105,6 +123,7 @@ class ESAMCCLIPModel(_BaseESAMCCLIPModel):
         self.use_refine_head = bool(use_refine_head)
         self.refine_head_hidden_dim = int(refine_head_hidden_dim)
         self._last_decode_debug: Dict[str, Any] = {}
+        self._refine_head_structure_info = validate_refine_head_structure(self)
 
     def _prepare_refine_inputs(
         self,
@@ -239,7 +258,7 @@ def _remap_key(key: str) -> str:
 def _prepare_matched_state_dict(
     model: torch.nn.Module,
     state_dict: Dict[str, torch.Tensor],
-) -> Tuple[Dict[str, torch.Tensor], List[str], List[str], List[str], List[str], List[str]]:
+) -> Tuple[Dict[str, torch.Tensor], List[str], List[str], List[str], List[str], List[str], List[str]]:
     model_state = model.state_dict()
     matched_state: Dict[str, torch.Tensor] = {}
     matched_keys: List[str] = []
@@ -274,7 +293,18 @@ def _prepare_matched_state_dict(
         refine_head_matched_keys,
         missing_keys,
         unexpected_keys,
+        shape_mismatch_keys,
     )
+
+
+def _resolve_checkpoint_refine_flags(checkpoint: Dict[str, Any], state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    checkpoint_use_refine_head = bool(checkpoint.get("use_refine_head", False))
+    checkpoint_has_refine_keys = any(_remap_key(str(raw_key)).startswith("refine_head.") for raw_key in state_dict.keys())
+    return {
+        "checkpoint_use_refine_head": checkpoint_use_refine_head,
+        "checkpoint_has_refine_keys": checkpoint_has_refine_keys,
+        "checkpoint_claims_refine": bool(checkpoint_use_refine_head or checkpoint_has_refine_keys),
+    }
 
 
 def load_checkpoint_safely(
@@ -284,17 +314,34 @@ def load_checkpoint_safely(
     strict: bool = False,
     require_decoder_match: bool = True,
 ):
-    checkpoint_path = Path(ckpt_path)
     map_location = device if device is not None else "cpu"
-    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    if isinstance(ckpt_path, dict):
+        checkpoint = ckpt_path
+        checkpoint_path = "<in_memory_checkpoint>"
+    else:
+        checkpoint_path = Path(ckpt_path)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     state_dict = load_state_dict_flexible(checkpoint)
-    matched_state, matched_keys, decoder_matched_keys, refine_head_matched_keys, missing_keys, unexpected_keys = _prepare_matched_state_dict(
+    matched_state, matched_keys, decoder_matched_keys, refine_head_matched_keys, missing_keys, unexpected_keys, shape_mismatch_keys = _prepare_matched_state_dict(
         model,
         state_dict,
     )
-    shape_mismatch_keys = [item for item in unexpected_keys if ": ckpt=" in item]
+    refine_flags = _resolve_checkpoint_refine_flags(checkpoint, state_dict)
+    refine_shape_mismatch_keys = [key for key in shape_mismatch_keys if key.startswith("refine_head.")]
+    missing_refine_keys = [key for key in missing_keys if key.startswith("refine_head.")]
+    model_use_refine_head = bool(getattr(model, "use_refine_head", False))
     if require_decoder_match and len(decoder_matched_keys) == 0:
         raise RuntimeError("checkpoint 未命中任何 decoder 参数，拒绝热启动。")
+    if refine_flags["checkpoint_claims_refine"]:
+        if len(refine_head_matched_keys) == 0:
+            raise RuntimeError(
+                "checkpoint 声明/包含 refine_head，但未命中任何 refine_head 参数，拒绝加载。"
+            )
+        if refine_shape_mismatch_keys:
+            raise RuntimeError(
+                "checkpoint refine_head 形状不匹配，拒绝加载: "
+                f"{refine_shape_mismatch_keys[:10]}"
+            )
     if strict:
         blocking_missing = [key for key in missing_keys if not key.startswith("refine_head.")]
         if blocking_missing or unexpected_keys:
@@ -311,7 +358,12 @@ def load_checkpoint_safely(
         "missing_keys": missing_keys,
         "unexpected_keys": unexpected_keys,
         "shape_mismatch_keys": shape_mismatch_keys,
-        "checkpoint_use_refine_head": bool(checkpoint.get("use_refine_head", False)),
+        "checkpoint_use_refine_head": refine_flags["checkpoint_use_refine_head"],
+        "checkpoint_has_refine_keys": refine_flags["checkpoint_has_refine_keys"],
+        "checkpoint_claims_refine": refine_flags["checkpoint_claims_refine"],
+        "model_use_refine_head": model_use_refine_head,
+        "refine_shape_mismatch_keys": refine_shape_mismatch_keys,
+        "missing_refine_keys": missing_refine_keys,
     }
     model._last_checkpoint_load_info = load_info
     LOGGER.info("checkpoint loaded: %s", checkpoint_path)
@@ -324,8 +376,19 @@ def load_checkpoint_safely(
         len(unexpected_keys),
         strict,
     )
+    LOGGER.info(
+        "checkpoint_use_refine_head=%s model_use_refine_head=%s refine_head_matched_count=%d refine_shape_mismatch_count=%d",
+        refine_flags["checkpoint_use_refine_head"],
+        model_use_refine_head,
+        len(refine_head_matched_keys),
+        len(refine_shape_mismatch_keys),
+    )
+    if not refine_flags["checkpoint_claims_refine"] and missing_refine_keys and model_use_refine_head:
+        LOGGER.info("old checkpoint has no refine_head, keep zero-init refine_head")
     if missing_keys:
         LOGGER.info("missing_keys_preview=%s", missing_keys[:20])
+    if missing_refine_keys:
+        LOGGER.info("missing_refine_keys_preview=%s", missing_refine_keys[:20])
     if unexpected_keys:
         LOGGER.info("unexpected_keys_preview=%s", unexpected_keys[:20])
     return checkpoint, missing_keys, unexpected_keys
