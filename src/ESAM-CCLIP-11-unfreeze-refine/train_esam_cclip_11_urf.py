@@ -273,6 +273,8 @@ def save_metrics_snapshot(run_dir: Path, epoch: int, history, best_metrics, trai
         "rare_class_keep_ratio": float(args.rare_class_keep_ratio),
         "rare_oversample": _json_safe(args.rare_oversample),
         "class_loss_weight": _json_safe(args.class_weights),
+        "reference_old5": float(args.reference_old5),
+        "reference_old5_source": str(getattr(args, "reference_old5_source", "none")),
         "train": _json_safe(train_stats),
         "val": _json_safe(val_metrics),
         "best_metrics": _json_safe(best_metrics),
@@ -376,6 +378,7 @@ def build_argparser():
     parser.add_argument("--warmup_epochs", type=int, default=WARMUP_EPOCHS)
     parser.add_argument("--min_lr_ratio", type=float, default=MIN_LR_RATIO)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--reference_old5", type=float, default=-1.0)
     parser.set_defaults(
         amp=AMP,
         freeze_image_encoder=FREEZE_IMAGE_ENCODER,
@@ -932,6 +935,15 @@ def compute_selection_score(current_all11: float, current_old5: float, current_r
     return float(score), float(old_drop_penalty)
 
 
+def resolve_score_reference_old5(args, best_metrics) -> Tuple[Optional[float], str]:
+    if float(args.reference_old5) >= 0:
+        return float(args.reference_old5), "cli"
+    best_old5 = best_metrics.get("best_old5", -1.0)
+    if best_old5 is not None and float(best_old5) >= 0:
+        return float(best_old5), "run_best"
+    return None, "none"
+
+
 def plot_results(history, save_path, no_val=False):
     fig = plt.figure(figsize=(16, 8))
     epochs = range(1, len(history["train_loss"]) + 1)
@@ -1103,6 +1115,8 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "unfreeze_image_mode": args.unfreeze_image_mode,
         "image_lr": float(args.image_lr),
         "grad_clip": float(args.grad_clip),
+        "reference_old5": float(args.reference_old5),
+        "reference_old5_source": str(getattr(args, "reference_old5_source", "none")),
         "use_refine_head": bool(args.use_refine_head),
         "train_refine_head": bool(args.train_refine_head),
         "refine_lr": float(args.refine_lr),
@@ -1257,6 +1271,7 @@ def main():
     LOGGER.info("rare_class_keep_ratio=%s", args.rare_class_keep_ratio)
     LOGGER.info("rare_balance_enabled=%s", args.rare_balance_enabled)
     LOGGER.info("rare_oversample=%s", args.rare_oversample)
+    LOGGER.info("reference_old5=%s", args.reference_old5)
     LOGGER.info("class loss weights=%s", args.class_weights)
     if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset", "stage1_rare_rescue", "unfreeze_recalibrate", "text_realign_1ep"} and args.resume is None and args.resume_best is None:
         LOGGER.warning("preset=%s 建议显式传入 --resume_best 或 --resume 作为热启动起点。", args.preset)
@@ -1451,7 +1466,8 @@ def main():
             current_old5 = val_metrics.get("iou/old5", 0.0)
             current_rare = val_metrics.get("iou/rare", 0.0)
             current_pos_only = val_metrics.get("iou/pos_only", 0.0)
-            score_reference_old5 = best_metrics["best_old5"] if best_metrics.get("best_old5", -1.0) >= 0 else None
+            score_reference_old5, reference_old5_source = resolve_score_reference_old5(args, best_metrics)
+            args.reference_old5_source = reference_old5_source
             selection_score, old_drop_penalty = compute_selection_score(
                 current_all11=current_all11,
                 current_old5=current_old5,
@@ -1460,6 +1476,7 @@ def main():
             )
             history["selection_score"].append(selection_score)
             history["old_drop_penalty"].append(old_drop_penalty)
+            history["reference_old5"].append(score_reference_old5 if score_reference_old5 is not None else "")
 
             LOGGER.info(
                 "TrainLoss=%.4f BCE=%.4f Dice=%.4f Focal=%.4f all11_mIoU=%.4f old5_mIoU=%.4f rare_mIoU=%.4f "
@@ -1480,6 +1497,11 @@ def main():
                 train_stats["epoch_time"],
                 train_stats["batch_time"],
                 100.0 * train_stats["image_cache_hit_rate"],
+            )
+            LOGGER.info(
+                "reference_old5_source=%s reference_old5=%s",
+                reference_old5_source,
+                "none" if score_reference_old5 is None else f"{score_reference_old5:.4f}",
             )
             LOGGER.info("Per-class IoU: %s", "  ".join(f"{name}={val_metrics.get(f'iou/{name}', 0.0):.3f}" for name in CLASSES))
         if torch.cuda.is_available() and device.type == "cuda":

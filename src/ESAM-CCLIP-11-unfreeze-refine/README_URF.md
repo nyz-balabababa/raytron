@@ -131,6 +131,40 @@ python src/ESAM-CCLIP-11-unfreeze-refine/train_esam_cclip_11_urf.py ^
   --output_dir D:\nyz\raytron_project\test\train_output
 ```
 
+```powershell
+python src/ESAM-CCLIP-11-unfreeze-refine/train_esam_cclip_11_urf.py `
+  --preset balanced_recalibrate `
+  --resume runs/URF_A_manual/A1_unfreeze/A1_unfreeze/best.pt `
+  --resume_weights_only `
+  --no_auto_resume `
+  --output_dir runs/URF_A_manual/A2_recalibrate `
+  --run_name A2_recalibrate `
+  --pipeline_name A `
+  --pipeline_stage A2_recalibrate `
+  --no_use_refine_head `
+  --device cuda `
+  --num_workers 4 `
+  --batch_size 8
+```
+
+### pipelineA:
+
+```powershell
+partial_unfreeze_balanced_safe
+-> freeze recalibrate
+-> zero_init_refine
+```
+
+### pipeline B：
+
+```
+zero_init_refine
+-> partial_unfreeze_balanced_safe
+-> balanced_recalibrate_refine
+```
+
+
+
 ### 跑整条 Pipeline
 
 `unfreeze_then_refine`:

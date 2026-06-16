@@ -75,6 +75,7 @@ def build_stage_command(
     device: str | None,
     batch_size: int | None,
     num_workers: int | None,
+    reference_old5: float,
 ) -> list[str]:
     stage_name = stage_spec["stage_name"]
     command = [
@@ -101,6 +102,8 @@ def build_stage_command(
         command.extend(["--batch_size", str(batch_size)])
     if num_workers is not None:
         command.extend(["--num_workers", str(num_workers)])
+    if float(reference_old5) >= 0:
+        command.extend(["--reference_old5", str(reference_old5)])
     command.extend(stage_spec.get("extra_args", []))
     return command
 
@@ -138,6 +141,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--reference_old5", type=float, default=-1.0)
     args = parser.parse_args()
 
     base_ckpt = args.base_ckpt.resolve()
@@ -171,6 +175,7 @@ def main() -> None:
             device=args.device,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            reference_old5=args.reference_old5,
         )
 
         print(f"[Stage {index}] {stage_name}")

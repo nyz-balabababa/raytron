@@ -1269,12 +1269,15 @@ def load_checkpoint_flexible(
 
     missing_keys = [key for key in model_state.keys() if key not in matched_state]
     unexpected_keys.extend(shape_mismatch_keys)
-    checkpoint_use_refine_head = bool(checkpoint.get("use_refine_head", False))
+    metadata_use_refine_head = bool(checkpoint.get("use_refine_head", False))
     checkpoint_has_refine_keys = any(remap_key(str(raw_key)).startswith("refine_head.") for raw_key in state_dict.keys())
+    checkpoint_use_refine_head = bool(metadata_use_refine_head or checkpoint_has_refine_keys)
     checkpoint_claims_refine = bool(checkpoint_use_refine_head or checkpoint_has_refine_keys)
     refine_shape_mismatch_keys = [key for key in shape_mismatch_keys if key.startswith("refine_head.")]
     missing_refine_keys = [key for key in missing_keys if key.startswith("refine_head.")]
     model_use_refine_head = bool(getattr(model, "use_refine_head", False))
+    if not metadata_use_refine_head and checkpoint_has_refine_keys:
+        LOGGER.warning("checkpoint contains refine_head keys but metadata use_refine_head=False, enabling refine_head automatically")
     if len(decoder_matched_keys) == 0:
         raise RuntimeError("decoder_matched_keys=0，说明 decoder 没有成功加载，不能提交")
     if checkpoint_claims_refine:
@@ -1286,6 +1289,13 @@ def load_checkpoint_flexible(
                 f"{refine_shape_mismatch_keys[:10]}"
             )
     model.load_state_dict(matched_state, strict=False)
+    if checkpoint_use_refine_head:
+        if not bool(getattr(model, "use_refine_head", False)):
+            raise RuntimeError("checkpoint_use_refine_head=True，但 model.use_refine_head=False，拒绝提交")
+        if len(refine_head_matched_keys) <= 0:
+            raise RuntimeError("checkpoint_use_refine_head=True，但 refine_head_matched_keys=0，拒绝提交")
+        if refine_shape_mismatch_keys:
+            raise RuntimeError("checkpoint_use_refine_head=True，但 refine_head 存在 shape mismatch，拒绝提交")
     model._last_checkpoint_load_info = {
         "checkpoint_path": str(checkpoint_path),
         "matched_keys": matched_keys,
@@ -1297,6 +1307,7 @@ def load_checkpoint_flexible(
         "shape_mismatch_keys": shape_mismatch_keys,
         "refine_shape_mismatch_keys": refine_shape_mismatch_keys,
         "checkpoint_use_refine_head": checkpoint_use_refine_head,
+        "metadata_use_refine_head": metadata_use_refine_head,
         "checkpoint_has_refine_keys": checkpoint_has_refine_keys,
         "checkpoint_claims_refine": checkpoint_claims_refine,
         "model_use_refine_head": model_use_refine_head,
@@ -1311,8 +1322,10 @@ def load_checkpoint_flexible(
         len(unexpected_keys),
     )
     LOGGER.info(
-        "checkpoint_use_refine_head=%s model_use_refine_head=%s refine_head_matched_count=%d refine_shape_mismatch_count=%d",
+        "checkpoint_use_refine_head=%s checkpoint_has_refine_keys=%s checkpoint_claims_refine=%s model_use_refine_head=%s refine_head_matched_count=%d refine_shape_mismatch_count=%d",
         checkpoint_use_refine_head,
+        checkpoint_has_refine_keys,
+        checkpoint_claims_refine,
         model_use_refine_head,
         len(refine_head_matched_keys),
         len(refine_shape_mismatch_keys),
@@ -1330,7 +1343,7 @@ def resolve_checkpoint_use_refine_head(checkpoint: Dict[str, Any]) -> bool:
     if bool(checkpoint.get("use_refine_head", False)):
         return True
     state_dict = load_state_dict_flexible(checkpoint)
-    return any(str(raw_key).startswith("refine_head.") for raw_key in state_dict.keys())
+    return any(remap_key(str(raw_key)).startswith("refine_head.") for raw_key in state_dict.keys())
 
 
 def normalize_decoder_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1928,7 +1941,12 @@ def load_model(
     checkpoint_preview = load_checkpoint_payload(checkpoint_path, device)
     classes = resolve_checkpoint_classes(checkpoint_preview)
     prompt_prototypes = resolve_checkpoint_prompt_prototypes(checkpoint_preview, classes)
+    checkpoint_has_refine_keys = any(
+        remap_key(str(raw_key)).startswith("refine_head.")
+        for raw_key in load_state_dict_flexible(checkpoint_preview).keys()
+    )
     checkpoint_use_refine_head = resolve_checkpoint_use_refine_head(checkpoint_preview)
+    checkpoint_claims_refine = bool(checkpoint_use_refine_head or checkpoint_has_refine_keys)
     prompt_prototypes_source = (
         str(checkpoint_preview.get("prompt_prototypes_source", "default"))
         if isinstance(checkpoint_preview, dict)
@@ -1951,7 +1969,15 @@ def load_model(
         checkpoint_path,
     )
     model.set_refine_head_enabled(checkpoint_use_refine_head)
-    LOGGER.info("use_refine_head=%s", checkpoint_use_refine_head)
+    load_info = getattr(model, "_last_checkpoint_load_info", {})
+    LOGGER.info(
+        "checkpoint_use_refine_head=%s checkpoint_has_refine_keys=%s checkpoint_claims_refine=%s model_use_refine_head=%s refine_head_matched_keys_count=%d",
+        checkpoint_use_refine_head,
+        checkpoint_has_refine_keys,
+        checkpoint_claims_refine,
+        bool(getattr(model, "use_refine_head", False)),
+        len(load_info.get("refine_head_matched_keys", [])),
+    )
     if missing_keys:
         LOGGER.warning("checkpoint missing_keys=%d，前10项: %s", len(missing_keys), missing_keys[:10])
     if unexpected_keys:
