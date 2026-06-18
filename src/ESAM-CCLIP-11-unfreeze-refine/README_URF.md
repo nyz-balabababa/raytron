@@ -109,14 +109,15 @@
 ### 单段训练
 
 ```powershell
-python src/ESAM-CCLIP-11-unfreeze-refine/train_esam_cclip_11_urf.py ^
-  --preset partial_unfreeze_balanced_safe ^
-  --resume D:\nyz\raytron_project\test\train_output\YOUR_BASE\best.pt ^
-  --resume_weights_only ^
-  --no_auto_resume ^
-  --output_dir D:\nyz\raytron_project\test\train_output ^
-  --device cuda ^
-  --batch_size 8 ^
+python src/ESAM-CCLIP-11-unfreeze-refine/train_esam_cclip_11_urf.py `
+  --preset partial_unfreeze_balanced_safe `
+  --resume E:\nyz_project\rayton\test\train_output\ESAM-CCLIP-11-old-balanced\final_fullset.pt `
+  --resume_weights_only `
+  --no_auto_resume `
+  --output_dir E:\nyz_project\rayton\test\train_output\ESAM-last-v1 `
+  --run_name ESAM-CCLIP-11-urf-unfreeze-split-1ep `
+  --device cuda `
+  --batch_size 8 `
   --num_workers 8
 ```
 
@@ -134,14 +135,16 @@ python src/ESAM-CCLIP-11-unfreeze-refine/train_esam_cclip_11_urf.py ^
 ```powershell
 python src/ESAM-CCLIP-11-unfreeze-refine/train_esam_cclip_11_urf.py `
   --preset balanced_recalibrate `
-  --resume runs/URF_A_manual/A1_unfreeze/A1_unfreeze/best.pt `
+  --resume E:\nyz_project\rayton\test\train_output\ESAM-last-v1\ESAM-CCLIP-11-urf-unfreeze-split-1ep\best.pt `
   --resume_weights_only `
   --no_auto_resume `
-  --output_dir runs/URF_A_manual/A2_recalibrate `
-  --run_name A2_recalibrate `
+  --output_dir E:\nyz_project\rayton\test\train_output\ESAM-last-v1 `
+  --run_name ESAM-CCLIP-11-urf-A2-recalibrate-split-1ep `
   --pipeline_name A `
   --pipeline_stage A2_recalibrate `
   --no_use_refine_head `
+  --freeze_image_encoder `
+  --freeze_text_encoder `
   --device cuda `
   --num_workers 4 `
   --batch_size 8

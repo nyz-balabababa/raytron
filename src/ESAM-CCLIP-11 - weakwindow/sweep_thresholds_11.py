@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 import torch
 
-from config_esam_cclip_11_urf import (
+from config_esam_cclip_11 import (
     BATCH_SIZE,
     CLASSES,
     DEVICE,
@@ -37,19 +37,19 @@ from config_esam_cclip_11_urf import (
     VAL_JSON,
     VAL_LIST,
 )
-from common_esam_cclip_11_urf import (
+from common_esam_cclip_11 import (
+    ESAMCCLIPModel,
     compute_metrics,
-    load_state_dict_flexible,
     load_tokenizer,
     maybe_tqdm,
     normalize_text_feature,
     resolve_device,
     save_json,
 )
-from dataset_esam_cclip_11_urf import ESAMCCLIP11Dataset
-from model_esam_cclip_11_urf import ESAMCCLIPModel, load_checkpoint_flexible
-from path_utils_urf import ensure_dir, ensure_file, resolve_project_path
-from prompt_prototypes_urf import load_or_build_text_cache
+from dataset_esam_cclip_11 import ESAMCCLIP11Dataset
+from model_esam_cclip_11 import load_checkpoint_flexible
+from path_utils import ensure_dir, ensure_file, resolve_project_path
+from prompt_prototypes import load_or_build_text_cache
 
 LOGGER = logging.getLogger("ESAM_CCLIP_11_SWEEP")
 
@@ -69,6 +69,21 @@ EXPECTED_CLASSES = [
 
 OLD_CLASSES = {"person", "car", "building", "tree", "animal"}
 RARE_CLASSES = {"trash can", "window", "door", "fence", "pole_light", "motorcycle"}
+GROUP_CLASS_NAMES = {
+    "all11": list(EXPECTED_CLASSES),
+    "old5": ["person", "car", "building", "tree", "animal"],
+    "rare6": ["trash can", "window", "door", "fence", "pole_light", "motorcycle"],
+    "rare_without_window": ["trash can", "door", "fence", "pole_light", "motorcycle"],
+    "all10_no_window": ["person", "car", "building", "tree", "animal", "trash can", "door", "fence", "pole_light", "motorcycle"],
+    "rare_no_window": ["trash can", "door", "fence", "pole_light", "motorcycle"],
+    "window": ["window"],
+}
+OBJECTIVE_WEIGHTS = {
+    "all11": {"all11": 1.0},
+    "balanced": {"old5": 0.60, "rare_no_window": 0.35, "window": 0.05},
+    "weak_window_balanced": {"old5": 0.60, "rare_without_window": 0.35, "window": 0.05},
+    "rare_without_window_safe": {"old5": 0.65, "rare_without_window": 0.35},
+}
 
 DEFAULT_CHECKPOINT = OUTPUT_ROOT / RUN_NAME / "best_all11.pt"
 DEFAULT_TEXT_CACHE_PATH = TEXT_CACHE_PATH
@@ -81,7 +96,36 @@ DEFAULT_SWEEP_CACHE_DIR = ROOT / "test" / "cache" / "sweep_thresholds_11"
 DEFAULT_PROMPT_FUSION_MODE = "prototype"
 DEFAULT_RAW_PROMPT_WEIGHT = 0.0
 DEFAULT_PROMPT_MATCH_MODE = "exact"
-DEFAULT_OBJECTIVE = "balanced"
+WEAKWINDOW_SWEEP_ROOT = ROOT / "test" / "train_output" / "ESAM-CCLIP-11-weakwindow"
+WINDOW_CONSERVATIVE_THRESH_GRID = [0.50, 0.55, 0.60, 0.65, 0.70]
+WINDOW_CONSERVATIVE_MIN_AREA_GRID = [8, 16, 32]
+WINDOW_CONSERVATIVE_TOPK_GRID = [None, 3]
+WEAK3_THRESH_GRID = {
+    "person": [0.42, 0.45, 0.50],
+    "car": [0.50, 0.55, 0.60],
+    "building": [0.42, 0.45, 0.50],
+    "tree": [0.35, 0.40, 0.45],
+    "animal": [0.28, 0.32, 0.36],
+    "trash can": [0.28, 0.32, 0.36],
+    "window": [0.50, 0.55, 0.60, 0.65, 0.70],
+    "door": [0.40, 0.45, 0.50],
+    "fence": [0.40, 0.45, 0.50],
+    "pole_light": [0.45, 0.50, 0.55],
+    "motorcycle": [0.35, 0.40, 0.45],
+}
+WEAK3_MIN_AREA_GRID = {
+    "person": [32, 64],
+    "car": [64, 96, 128],
+    "building": [128, 192, 256],
+    "tree": [128, 160, 224],
+    "animal": [32, 64],
+    "trash can": [16, 32],
+    "window": [32, 64, 96],
+    "door": [48, 64, 96],
+    "fence": [8, 16, 32],
+    "pole_light": [8, 16, 32],
+    "motorcycle": [16, 32],
+}
 
 SUBMIT_CLEAN_PROMPT_PROTOTYPES = {
     "person": ["person", "people", "pedestrian", "human", "人", "行人"],
@@ -295,45 +339,14 @@ STAGE2_REFINE_RARE_TOPK_GRID = {
     "pole_light": [None, 2],
 }
 
-OLD5_SAFE_THRESH_GRID = {
-    "person": [0.50, 0.55, 0.60, 0.65],
-    "car": [0.55, 0.60, 0.65, 0.70],
-    "building": [0.55, 0.60, 0.65, 0.70],
-    "tree": [0.45, 0.50, 0.55, 0.60],
-    "animal": [0.40, 0.45, 0.50, 0.55],
-}
-
-OLD5_SAFE_MIN_AREA_GRID = {
-    "person": [16, 24, 32, 48],
-    "car": [32, 48, 64, 96],
-    "building": [128, 192, 256, 384],
-    "tree": [32, 64, 96, 128],
-    "animal": [16, 24, 32, 48],
-}
-
-RARE_CONSERVATIVE_FIXED_CFG = {
-    "trash can": {"threshold": 0.40, "min_area": 12, "topk_components": None},
-    "window": {"threshold": 0.40, "min_area": 8, "topk_components": None},
-    "door": {"threshold": 0.40, "min_area": 12, "topk_components": None},
-    "fence": {"threshold": 0.35, "min_area": 8, "topk_components": 3},
-    "pole_light": {"threshold": 0.32, "min_area": 6, "topk_components": None},
-    "motorcycle": {"threshold": 0.40, "min_area": 16, "topk_components": None},
-}
-
-OLD5_SAFE_CLASS_WEIGHTS = {
-    "person": 0.30,
-    "car": 0.25,
-    "building": 0.25,
-    "tree": 0.15,
-    "animal": 0.05,
-}
-
 
 def canonicalize_sweep_mode(sweep_mode: str) -> str:
     if sweep_mode == "safe":
         return "best"
     if sweep_mode in {"stage2_submit_refine", "submit_stage2_refine"}:
         return "stage2_refine"
+    if sweep_mode in {"weak3", "weak3safe"}:
+        return "weak3_safe"
     return sweep_mode
 
 
@@ -344,19 +357,14 @@ def resolve_prompt_prototypes_for_sweep(sweep_mode: str) -> Dict[str, List[str]]
     return PROMPT_PROTOTYPES
 
 
-def resolve_effective_objective(objective: Optional[str], sweep_mode: Optional[str]) -> str:
-    if objective:
-        return str(objective)
-    sweep_mode = canonicalize_sweep_mode(sweep_mode or DEFAULT_SWEEP_MODE)
-    if sweep_mode in {"stage2_submit_safe", "hybrid_safe"}:
-        return "submit_safe"
-    return DEFAULT_OBJECTIVE
-
-
 def resolve_threshold_grid(sweep_mode: str) -> dict:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
     if sweep_mode == "best":
-        return BEST_THRESH_GRID
+        grid = dict(BEST_THRESH_GRID)
+        grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
+        return grid
+    if sweep_mode == "weak3_safe":
+        return dict(WEAK3_THRESH_GRID)
     if sweep_mode == "stage2_refine":
         grid = {}
         for class_name in CLASSES:
@@ -364,6 +372,7 @@ def resolve_threshold_grid(sweep_mode: str) -> dict:
                 grid[class_name] = STAGE2_REFINE_OLD_THRESH_GRID[class_name]
             else:
                 grid[class_name] = STAGE2_REFINE_RARE_THRESH_GRID[class_name]
+        grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
         return grid
     if sweep_mode == "stage2_submit_safe":
         grid = {}
@@ -372,6 +381,7 @@ def resolve_threshold_grid(sweep_mode: str) -> dict:
                 grid[class_name] = STAGE2_SUBMIT_OLD_THRESH_GRID[class_name]
             else:
                 grid[class_name] = STAGE2_SUBMIT_RARE_THRESH_GRID[class_name]
+        grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
         return grid
     if sweep_mode == "hybrid_safe":
         hybrid_safe_grid = {}
@@ -380,6 +390,7 @@ def resolve_threshold_grid(sweep_mode: str) -> dict:
                 hybrid_safe_grid[class_name] = [HYBRID_SAFE_FIXED_OLD_CFG[class_name]["threshold"]]
             else:
                 hybrid_safe_grid[class_name] = HYBRID_SAFE_RARE_THRESH_GRID[class_name]
+        hybrid_safe_grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
         return hybrid_safe_grid
     if sweep_mode == "hybrid":
         hybrid_grid = {}
@@ -388,30 +399,27 @@ def resolve_threshold_grid(sweep_mode: str) -> dict:
                 hybrid_grid[class_name] = BEST_THRESH_GRID[class_name]
             else:
                 hybrid_grid[class_name] = FINE_RECALL_THRESH_GRID[class_name]
+        hybrid_grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
         return hybrid_grid
     if sweep_mode == "recall":
-        return RECALL_THRESH_GRID
-    if sweep_mode == "fine_recall":
-        return FINE_RECALL_THRESH_GRID
-    raise ValueError(f"unsupported sweep_mode: {sweep_mode}")
-
-
-def resolve_threshold_grid_for_objective(sweep_mode: str, objective: str) -> dict:
-    if objective in {"old5_safe", "submit_safe"}:
-        grid = {}
-        for class_name in CLASSES:
-            if class_name in OLD_CLASSES:
-                grid[class_name] = OLD5_SAFE_THRESH_GRID[class_name]
-            else:
-                grid[class_name] = [RARE_CONSERVATIVE_FIXED_CFG[class_name]["threshold"]]
+        grid = dict(RECALL_THRESH_GRID)
+        grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
         return grid
-    return resolve_threshold_grid(sweep_mode)
+    if sweep_mode == "fine_recall":
+        grid = dict(FINE_RECALL_THRESH_GRID)
+        grid["window"] = WINDOW_CONSERVATIVE_THRESH_GRID
+        return grid
+    raise ValueError(f"unsupported sweep_mode: {sweep_mode}")
 
 
 def resolve_min_area_grid(sweep_mode: str) -> dict:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
     if sweep_mode == "best":
-        return BEST_MIN_AREA_GRID
+        grid = dict(BEST_MIN_AREA_GRID)
+        grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
+        return grid
+    if sweep_mode == "weak3_safe":
+        return dict(WEAK3_MIN_AREA_GRID)
     if sweep_mode == "stage2_refine":
         grid = {}
         for class_name in CLASSES:
@@ -419,6 +427,7 @@ def resolve_min_area_grid(sweep_mode: str) -> dict:
                 grid[class_name] = STAGE2_REFINE_OLD_MIN_AREA_GRID[class_name]
             else:
                 grid[class_name] = STAGE2_REFINE_RARE_MIN_AREA_GRID[class_name]
+        grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
         return grid
     if sweep_mode == "stage2_submit_safe":
         grid = {}
@@ -427,6 +436,7 @@ def resolve_min_area_grid(sweep_mode: str) -> dict:
                 grid[class_name] = STAGE2_SUBMIT_OLD_MIN_AREA_GRID[class_name]
             else:
                 grid[class_name] = [STAGE2_SUBMIT_RARE_POST[class_name]["min_area"]]
+        grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
         return grid
     if sweep_mode == "hybrid_safe":
         hybrid_safe_grid = {}
@@ -435,6 +445,7 @@ def resolve_min_area_grid(sweep_mode: str) -> dict:
                 hybrid_safe_grid[class_name] = [HYBRID_SAFE_FIXED_OLD_CFG[class_name]["min_area"]]
             else:
                 hybrid_safe_grid[class_name] = [HYBRID_SAFE_RARE_FIXED_POST[class_name]["min_area"]]
+        hybrid_safe_grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
         return hybrid_safe_grid
     if sweep_mode == "hybrid":
         hybrid_grid = {}
@@ -443,55 +454,42 @@ def resolve_min_area_grid(sweep_mode: str) -> dict:
                 hybrid_grid[class_name] = BEST_MIN_AREA_GRID[class_name]
             else:
                 hybrid_grid[class_name] = FINE_RECALL_MIN_AREA_GRID[class_name]
+        hybrid_grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
         return hybrid_grid
     if sweep_mode == "fine_recall":
-        return FINE_RECALL_MIN_AREA_GRID
-    return BEST_MIN_AREA_GRID
-
-
-def resolve_min_area_grid_for_objective(sweep_mode: str, objective: str) -> dict:
-    if objective in {"old5_safe", "submit_safe"}:
-        grid = {}
-        for class_name in CLASSES:
-            if class_name in OLD_CLASSES:
-                grid[class_name] = OLD5_SAFE_MIN_AREA_GRID[class_name]
-            else:
-                grid[class_name] = [RARE_CONSERVATIVE_FIXED_CFG[class_name]["min_area"]]
+        grid = dict(FINE_RECALL_MIN_AREA_GRID)
+        grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
         return grid
-    return resolve_min_area_grid(sweep_mode)
+    grid = dict(BEST_MIN_AREA_GRID)
+    grid["window"] = WINDOW_CONSERVATIVE_MIN_AREA_GRID
+    return grid
 
 
 def resolve_default_output_dir(sweep_mode: str) -> Path:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
     if sweep_mode == "stage2_refine":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_stage2_refine"
+        return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_stage2_refine"
+    if sweep_mode == "weak3_safe":
+        return WEAKWINDOW_SWEEP_ROOT / "sweep_A2_weak_window"
     if sweep_mode == "stage2_submit_safe":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_stage2_submit_safe"
+        return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_stage2_submit_safe"
     if sweep_mode == "fine_recall":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_fine_recall"
+        return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_fine_recall"
     if sweep_mode == "hybrid_safe":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_hybrid_safe"
+        return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_hybrid_safe"
     if sweep_mode == "hybrid":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_hybrid"
+        return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_hybrid"
     if sweep_mode == "recall":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_recall"
-    return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_best"
-
-
-def resolve_default_output_dir_for_objective(sweep_mode: str, objective: str) -> Path:
-    if objective == "balanced":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_urf_balanced"
-    if objective == "old5_safe":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_urf_old5_safe"
-    if objective == "submit_safe":
-        return ROOT / "test" / "train_output" / "threshold_sweep_esam_11_urf_submit_safe"
-    return resolve_default_output_dir(sweep_mode)
+        return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_recall"
+    return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_best"
 
 
 def resolve_default_write_back_path(sweep_mode: str) -> Path:
     sweep_mode = canonicalize_sweep_mode(sweep_mode)
     if sweep_mode == "stage2_refine":
         return ROOT / "model" / "submit-rsam-stage2-refine" / "sam3.pt"
+    if sweep_mode == "weak3_safe":
+        return ROOT / "model" / "submit-rsam-weak3" / "sam3.pt"
     if sweep_mode == "stage2_submit_safe":
         return ROOT / "model" / "submit-rsam-stage2-safe" / "sam3.pt"
     if sweep_mode == "fine_recall":
@@ -503,16 +501,6 @@ def resolve_default_write_back_path(sweep_mode: str) -> Path:
     if sweep_mode == "recall":
         return ROOT / "model" / "submit-rsam-recall" / "sam3.pt"
     return ROOT / "model" / "submit-rsam-best" / "sam3.pt"
-
-
-def resolve_default_write_back_path_for_objective(sweep_mode: str, objective: str) -> Path:
-    if objective == "balanced":
-        return ROOT / "model" / "submit-rsam-urf-balanced" / "sam3.pt"
-    if objective == "old5_safe":
-        return ROOT / "model" / "submit-rsam-urf-old5-safe" / "sam3.pt"
-    if objective == "submit_safe":
-        return ROOT / "model" / "submit-rsam-urf-submit-safe" / "sam3.pt"
-    return resolve_default_write_back_path(sweep_mode)
 
 
 def atomic_torch_save(payload, path: Path):
@@ -918,29 +906,6 @@ def resolve_runtime_paths(args):
     return args
 
 
-def strip_state_key_prefix(key: str) -> str:
-    key = str(key)
-    for prefix in ("module.", "model.", "net."):
-        if key.startswith(prefix):
-            key = key[len(prefix):]
-    return key
-
-
-def checkpoint_has_refine_keys(checkpoint) -> bool:
-    state_dict = load_state_dict_flexible(checkpoint)
-    return any(strip_state_key_prefix(raw_key).startswith("refine_head.") for raw_key in state_dict.keys())
-
-
-def resolve_checkpoint_use_refine_head(checkpoint: Dict[str, Any], force_enable: bool, force_disable: bool) -> bool:
-    if force_disable:
-        return False
-    if force_enable:
-        return True
-    if bool(checkpoint.get("use_refine_head", False)):
-        return True
-    return checkpoint_has_refine_keys(checkpoint)
-
-
 @torch.no_grad()
 def collect_validation_logits(
     model,
@@ -954,7 +919,6 @@ def collect_validation_logits(
     prompt_match_mode=DEFAULT_PROMPT_MATCH_MODE,
     max_samples_per_class=500,
     seed=42,
-    use_refine_head=False,
 ):
     from torch.utils.data import DataLoader
 
@@ -982,13 +946,7 @@ def collect_validation_logits(
             )
             feature_list.append(feature)
         text_features = torch.stack(feature_list, dim=0).to(device)
-        logits = model.decode(
-            image_features,
-            text_features,
-            target_size=(dataset.img_size[0], dataset.img_size[1]),
-            images=images,
-            use_refine_head=use_refine_head,
-        )
+        logits = model.decode(image_features, text_features, target_size=(dataset.img_size[0], dataset.img_size[1]))
         for idx, class_name in enumerate(batch["class_names"]):
             seen_counts[class_name] += 1
             sample = {
@@ -1007,17 +965,25 @@ def collect_validation_logits(
     return records, seen_counts
 
 
-def default_cfg_for_class(class_name: str, threshold_grid: dict, min_area_grid: dict, sweep_mode: str, objective: str = DEFAULT_OBJECTIVE) -> dict:
+def default_cfg_for_class(class_name: str, threshold_grid: dict, min_area_grid: dict, sweep_mode: str) -> dict:
     return {
         "threshold": float(threshold_grid[class_name][0]),
         "min_area": int(min_area_grid[class_name][0]),
         "fill_holes": bool(POSTPROCESS_DEFAULT[class_name]["fill_holes"]),
-        "topk_components": resolve_topk_grid_for_objective(class_name, sweep_mode, objective)[0],
+        "topk_components": resolve_topk_grid(class_name, sweep_mode)[0],
     }
 
 
 def resolve_topk_grid(class_name: str, sweep_mode: Optional[str] = None):
     sweep_mode = canonicalize_sweep_mode(sweep_mode) if sweep_mode is not None else None
+    if sweep_mode == "weak3_safe":
+        if class_name == "window":
+            return [None, 3]
+        if class_name == "fence":
+            return [3]
+        return [None]
+    if class_name == "window":
+        return WINDOW_CONSERVATIVE_TOPK_GRID
     if sweep_mode == "stage2_refine":
         if class_name in OLD_CLASSES:
             return [None]
@@ -1033,67 +999,6 @@ def resolve_topk_grid(class_name: str, sweep_mode: Optional[str] = None):
             return [HYBRID_SAFE_FIXED_OLD_CFG[class_name]["topk_components"]]
         return [HYBRID_SAFE_RARE_FIXED_POST[class_name]["topk_components"]]
     return TOPK_COMPONENTS_GRID.get(class_name, [None])
-
-
-def resolve_topk_grid_for_objective(class_name: str, sweep_mode: str, objective: str):
-    if objective in {"old5_safe", "submit_safe"}:
-        if class_name in OLD_CLASSES:
-            return [None]
-        return [RARE_CONSERVATIVE_FIXED_CFG[class_name]["topk_components"]]
-    return resolve_topk_grid(class_name, sweep_mode)
-
-
-def compute_penalty_fp(metric_cfg: Dict[str, float]) -> float:
-    pred_area = float(metric_cfg.get("pred_area", 0.0))
-    gt_area = float(metric_cfg.get("gt_area", 0.0))
-    if pred_area <= gt_area:
-        return 0.0
-    denom = max(gt_area, 1.0)
-    return max(0.0, (pred_area - gt_area) / denom)
-
-
-def compute_candidate_score(class_name: str, metric_cfg: Dict[str, float], objective: str) -> Tuple[float, float]:
-    iou = float(metric_cfg.get("iou", 0.0))
-    penalty_fp = compute_penalty_fp(metric_cfg)
-    if objective == "old5_safe" and class_name in OLD_CLASSES:
-        return float(iou - 0.05 * penalty_fp), float(penalty_fp)
-    if objective == "submit_safe":
-        return float(iou - 0.08 * penalty_fp), float(penalty_fp)
-    return iou, penalty_fp
-
-
-def compute_overall_summary(best_metrics: Dict[str, Dict[str, float]], objective: str) -> Dict[str, float]:
-    old5_values = [float(best_metrics[class_name]["iou"]) for class_name in CLASSES if class_name in OLD_CLASSES]
-    rare_values = [float(best_metrics[class_name]["iou"]) for class_name in CLASSES if class_name in RARE_CLASSES]
-    all11_values = [float(best_metrics[class_name]["iou"]) for class_name in CLASSES]
-    old5_avg = float(np.mean(old5_values)) if old5_values else 0.0
-    rare_avg = float(np.mean(rare_values)) if rare_values else 0.0
-    all11_avg = float(np.mean(all11_values)) if all11_values else 0.0
-    penalty_fp_by_class = {
-        class_name: compute_penalty_fp(best_metrics[class_name])
-        for class_name in CLASSES
-    }
-    old5_penalty_fp = float(np.mean([penalty_fp_by_class[class_name] for class_name in CLASSES if class_name in OLD_CLASSES])) if OLD_CLASSES else 0.0
-    all_penalty_fp = float(np.mean(list(penalty_fp_by_class.values()))) if penalty_fp_by_class else 0.0
-    old5_safe_score = sum(
-        float(OLD5_SAFE_CLASS_WEIGHTS[class_name]) * float(best_metrics[class_name]["iou"])
-        for class_name in OLD5_SAFE_CLASS_WEIGHTS
-    ) - 0.05 * old5_penalty_fp
-    if objective == "old5_safe":
-        best_metric = float(old5_safe_score)
-    elif objective == "submit_safe":
-        best_metric = float(0.50 * old5_avg + 0.20 * rare_avg + 0.30 * all11_avg - 0.08 * all_penalty_fp)
-    else:
-        best_metric = float(all11_avg)
-    return {
-        "best_metric": float(best_metric),
-        "old5_avg": float(old5_avg),
-        "rare_avg": float(rare_avg),
-        "all11_avg": float(all11_avg),
-        "penalty_fp": float(all_penalty_fp),
-        "old5_penalty_fp": float(old5_penalty_fp),
-        "old5_safe_score": float(old5_safe_score),
-    }
 
 
 def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
@@ -1153,6 +1058,19 @@ def apply_postprocess_with_topk(
     return processed.astype(np.uint8)
 
 
+def compute_group_scores(per_class_scores: Dict[str, float]) -> Dict[str, float]:
+    group_scores = {}
+    for group_name, class_names in GROUP_CLASS_NAMES.items():
+        values = [float(per_class_scores.get(class_name, 0.0)) for class_name in class_names]
+        group_scores[group_name] = float(np.mean(values)) if values else 0.0
+    return group_scores
+
+
+def compute_objective_score(group_scores: Dict[str, float], objective: str) -> float:
+    weights = OBJECTIVE_WEIGHTS.get(objective, OBJECTIVE_WEIGHTS["all11"])
+    return float(sum(float(group_scores.get(group_name, 0.0)) * float(weight) for group_name, weight in weights.items()))
+
+
 def build_sweep_summary_lines(
     sweep_mode: str,
     objective: str,
@@ -1164,13 +1082,12 @@ def build_sweep_summary_lines(
     prompt_match_mode: str,
     sample_counts: dict,
     best_metric: float,
-    old5_avg: float,
-    rare_avg: float,
-    all11_avg: float,
     best_thresholds: dict,
     best_postprocess: dict,
     best_scores: dict,
     best_metrics: dict,
+    group_scores: dict,
+    objective_score: float,
     write_back_path: Optional[Path],
     threshold_grid: dict,
     min_area_grid: dict,
@@ -1186,21 +1103,9 @@ def build_sweep_summary_lines(
         f"raw_prompt_weight: {raw_prompt_weight:.3f}",
         f"prompt_match_mode: {prompt_match_mode}",
         f"best_metric: {best_metric:.6f}",
-        f"old5_avg: {old5_avg:.6f}",
-        f"rare_avg: {rare_avg:.6f}",
-        f"all11_avg: {all11_avg:.6f}",
+        f"objective_score: {objective_score:.6f}",
         "sample_counts:",
     ]
-    if objective == "old5_safe":
-        lines.append("objective formula: 0.30*person + 0.25*car + 0.25*building + 0.15*tree + 0.05*animal - penalty_fp")
-    elif objective == "submit_safe":
-        lines.append("objective formula: 0.50*old5_avg + 0.20*rare_avg + 0.30*all11_avg - 0.08*penalty_fp")
-    else:
-        lines.append("objective formula: balanced = all11_avg")
-    if objective in {"old5_safe", "submit_safe"}:
-        lines.append(f"old5 safe threshold grid: {json.dumps(OLD5_SAFE_THRESH_GRID, ensure_ascii=False)}")
-        lines.append(f"old5 safe min_area grid: {json.dumps(OLD5_SAFE_MIN_AREA_GRID, ensure_ascii=False)}")
-        lines.append(f"rare conservative cfg: {json.dumps(RARE_CONSERVATIVE_FIXED_CFG, ensure_ascii=False)}")
     if sweep_mode == "stage2_submit_safe":
         lines.append("stage2 submit safe mode")
         lines.append("old classes use narrow adaptive grid")
@@ -1217,6 +1122,10 @@ def build_sweep_summary_lines(
         lines.append(f"stage2 refine old min_area grid: {json.dumps(STAGE2_REFINE_OLD_MIN_AREA_GRID, ensure_ascii=False)}")
         lines.append(f"stage2 refine rare min_area grid: {json.dumps(STAGE2_REFINE_RARE_MIN_AREA_GRID, ensure_ascii=False)}")
         lines.append(f"stage2 refine rare topk grid: {json.dumps(STAGE2_REFINE_RARE_TOPK_GRID, ensure_ascii=False)}")
+    if sweep_mode == "weak3_safe":
+        lines.append("weak3 safe mode")
+        lines.append(f"weak3 threshold grid: {json.dumps(WEAK3_THRESH_GRID, ensure_ascii=False)}")
+        lines.append(f"weak3 min_area grid: {json.dumps(WEAK3_MIN_AREA_GRID, ensure_ascii=False)}")
     if sweep_mode == "hybrid_safe":
         lines.append("old classes are fixed")
         lines.append("rare classes threshold-only conservative sweep")
@@ -1224,6 +1133,14 @@ def build_sweep_summary_lines(
         lines.append(f"rare threshold grid: {json.dumps(HYBRID_SAFE_RARE_THRESH_GRID, ensure_ascii=False)}")
     for class_name in CLASSES:
         lines.append(f"  {class_name}: {int(sample_counts.get(class_name, 0))}")
+    lines.append("group_scores:")
+    for group_name in ["all11", "old5", "rare6", "rare_without_window", "all10_no_window", "rare_no_window", "window"]:
+        lines.append(f"  {group_name}: {float(group_scores.get(group_name, 0.0)):.6f}")
+    lines.append(f"all11_avg: {float(group_scores.get('all11', 0.0)):.6f}")
+    lines.append(f"old5_avg: {float(group_scores.get('old5', 0.0)):.6f}")
+    lines.append(f"rare_avg: {float(group_scores.get('rare6', 0.0)):.6f}")
+    lines.append(f"all10_no_window_avg: {float(group_scores.get('all10_no_window', 0.0)):.6f}")
+    lines.append(f"rare_no_window_avg: {float(group_scores.get('rare_no_window', 0.0)):.6f}")
     lines.append("best_per_class:")
     for class_name in CLASSES:
         post_cfg = best_postprocess[class_name]
@@ -1311,8 +1228,8 @@ def main():
     parser.add_argument("--text_cache_path", type=Path, default=DEFAULT_TEXT_CACHE_PATH)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE if DEFAULT_DEVICE else ("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--objective", choices=["balanced", "old5_safe", "submit_safe"], default=None)
-    parser.add_argument("--sweep_mode", choices=["best", "safe", "recall", "fine_recall", "hybrid", "hybrid_safe", "stage2_submit_safe", "stage2_refine", "stage2_submit_refine", "submit_stage2_refine"], default=DEFAULT_SWEEP_MODE)
+    parser.add_argument("--sweep_mode", choices=["best", "safe", "recall", "fine_recall", "hybrid", "hybrid_safe", "stage2_submit_safe", "stage2_refine", "stage2_submit_refine", "submit_stage2_refine", "weak3_safe", "weak3", "weak3safe"], default=DEFAULT_SWEEP_MODE)
+    parser.add_argument("--objective", choices=["all11", "balanced", "weak_window_balanced", "rare_without_window_safe"], default="all11")
     parser.add_argument("--write_back_checkpoint", dest="write_back_checkpoint", action="store_true")
     parser.add_argument("--no_write_back_checkpoint", dest="write_back_checkpoint", action="store_false")
     parser.add_argument("--write_back_path", type=Path, default=None)
@@ -1323,9 +1240,6 @@ def main():
     parser.add_argument("--prompt_fusion_mode", choices=["prototype", "raw", "blend"], default=DEFAULT_PROMPT_FUSION_MODE)
     parser.add_argument("--raw_prompt_weight", type=float, default=DEFAULT_RAW_PROMPT_WEIGHT)
     parser.add_argument("--prompt_match_mode", choices=["exact", "soft", "target_soft"], default=DEFAULT_PROMPT_MATCH_MODE)
-    parser.add_argument("--use_refine_head", action="store_true", default=False)
-    parser.add_argument("--disable_refine_head", action="store_true", default=False)
-    parser.add_argument("--refine_head_hidden_dim", type=int, default=16)
     parser.set_defaults(
         write_back_checkpoint=DEFAULT_WRITE_BACK_CHECKPOINT,
         rebuild_text_cache=DEFAULT_REBUILD_TEXT_CACHE,
@@ -1334,7 +1248,6 @@ def main():
 
     requested_sweep_mode = args.sweep_mode
     args.sweep_mode = canonicalize_sweep_mode(args.sweep_mode)
-    args.objective = resolve_effective_objective(args.objective, args.sweep_mode)
     if requested_sweep_mode == "safe":
         LOGGER.warning("sweep_mode=safe is deprecated and now maps to sweep_mode=best")
 
@@ -1343,25 +1256,24 @@ def main():
     if args.sweep_mode in {"stage2_submit_safe", "stage2_refine"} and args.text_cache_path == DEFAULT_TEXT_CACHE_PATH:
         args.text_cache_path = Path(DEFAULT_TEXT_CACHE_PATH).with_name("text_emb_11_submit_clean.pt")
 
-    args.output_dir = args.output_dir or resolve_default_output_dir_for_objective(args.sweep_mode, args.objective)
+    args.output_dir = args.output_dir or resolve_default_output_dir(args.sweep_mode)
     if args.out_checkpoint is not None:
         if args.write_back_path is not None:
             LOGGER.warning("--out_checkpoint and --write_back_path were both provided; using --out_checkpoint")
         args.write_back_path = args.out_checkpoint
         args.write_back_checkpoint = True
     if args.write_back_checkpoint:
-        args.write_back_path = args.write_back_path or resolve_default_write_back_path_for_objective(args.sweep_mode, args.objective)
+        args.write_back_path = args.write_back_path or resolve_default_write_back_path(args.sweep_mode)
     args = resolve_runtime_paths(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_log_path = args.output_dir / "sweep_run.log"
     attach_file_logging(run_log_path)
-    threshold_grid = resolve_threshold_grid_for_objective(args.sweep_mode, args.objective)
-    min_area_grid = resolve_min_area_grid_for_objective(args.sweep_mode, args.objective)
+    threshold_grid = resolve_threshold_grid(args.sweep_mode)
+    min_area_grid = resolve_min_area_grid(args.sweep_mode)
     args.raw_prompt_weight = min(max(float(args.raw_prompt_weight), 0.0), 1.0)
 
     device = resolve_device(args.device)
     LOGGER.info("sweep_mode=%s", args.sweep_mode)
-    LOGGER.info("objective=%s", args.objective)
     LOGGER.info("checkpoint=%s", args.checkpoint)
     LOGGER.info("text_cache_path=%s", args.text_cache_path)
     LOGGER.info("prompt_fusion_mode=%s", args.prompt_fusion_mode)
@@ -1377,34 +1289,8 @@ def main():
         efficient_sam_ckpt=EFFICIENT_SAM_CKPT,
         freeze_image=True,
         freeze_text=True,
-        use_refine_head=False,
-        refine_head_hidden_dim=args.refine_head_hidden_dim,
     ).to(device)
     checkpoint, _, _ = load_checkpoint_flexible(model, args.checkpoint, device)
-    checkpoint_use_refine_head = resolve_checkpoint_use_refine_head(
-        checkpoint,
-        force_enable=args.use_refine_head,
-        force_disable=args.disable_refine_head,
-    )
-    model.set_refine_head_enabled(checkpoint_use_refine_head)
-    checkpoint_refine_keys = checkpoint_has_refine_keys(checkpoint)
-    load_info = getattr(model, "_last_checkpoint_load_info", {}) or {}
-    refine_head_matched_keys = list(load_info.get("refine_head_matched_keys", []) or [])
-    refine_shape_mismatch_keys = list(load_info.get("refine_shape_mismatch_keys", []) or [])
-    LOGGER.info("checkpoint_use_refine_head=%s", checkpoint_use_refine_head)
-    LOGGER.info("checkpoint_has_refine_keys=%s", checkpoint_refine_keys)
-    LOGGER.info("model_use_refine_head=%s", bool(getattr(model, "use_refine_head", False)))
-    LOGGER.info("refine_head_matched_keys count=%d", len(refine_head_matched_keys))
-    LOGGER.info("refine_shape_mismatch_keys=%s", refine_shape_mismatch_keys)
-    if checkpoint_use_refine_head:
-        if not bool(getattr(model, "use_refine_head", False)):
-            raise RuntimeError("checkpoint requires refine_head but model.use_refine_head is False")
-        if len(refine_head_matched_keys) == 0:
-            raise RuntimeError("checkpoint_use_refine_head=True but refine_head_matched_keys=0")
-        if refine_shape_mismatch_keys:
-            raise RuntimeError(
-                f"checkpoint_use_refine_head=True but refine_shape_mismatch_keys is not empty: {refine_shape_mismatch_keys}"
-            )
     model.eval()
     tokenizer = load_tokenizer(args.tokenizer_dir)
     text_cache_payload = load_or_build_text_cache(
@@ -1469,7 +1355,6 @@ def main():
         prompt_match_mode=args.prompt_match_mode,
         max_samples_per_class=args.max_samples_per_class,
         seed=42,
-        use_refine_head=checkpoint_use_refine_head,
     )
     for class_name in CLASSES:
         LOGGER.info(
@@ -1488,7 +1373,7 @@ def main():
 
     for class_name in maybe_tqdm(CLASSES, total=len(CLASSES), desc="Sweep classes", leave=False):
         best_iou = -1.0
-        best_cfg = default_cfg_for_class(class_name, threshold_grid, min_area_grid, args.sweep_mode, args.objective)
+        best_cfg = default_cfg_for_class(class_name, threshold_grid, min_area_grid, args.sweep_mode)
         best_metric_cfg = {
             "iou": 0.0,
             "precision": 0.0,
@@ -1501,7 +1386,7 @@ def main():
         for threshold in threshold_grid[class_name]:
             for min_area in min_area_grid[class_name]:
                 fill_holes = bool(POSTPROCESS_DEFAULT[class_name]["fill_holes"])
-                for topk_components in resolve_topk_grid_for_objective(class_name, args.sweep_mode, args.objective):
+                for topk_components in resolve_topk_grid(class_name, args.sweep_mode):
                     metric_lists = defaultdict(list)
                     for sample in samples:
                         logit = np.asarray(sample["logit"], dtype=np.float32)
@@ -1521,11 +1406,11 @@ def main():
                         for metric_name in ["iou", "precision", "recall", "pred_area", "gt_area"]:
                             metric_lists[metric_name].append(float(metrics[metric_name]))
 
+                    score = float(np.mean(metric_lists["iou"])) if metric_lists["iou"] else 0.0
                     metric_cfg = {
                         metric_name: float(np.mean(values)) if values else 0.0
                         for metric_name, values in metric_lists.items()
                     }
-                    score, penalty_fp = compute_candidate_score(class_name, metric_cfg, args.objective)
                     summary_rows.append([
                         class_name,
                         threshold,
@@ -1537,8 +1422,6 @@ def main():
                         metric_cfg.get("recall", 0.0),
                         metric_cfg.get("pred_area", 0.0),
                         metric_cfg.get("gt_area", 0.0),
-                        penalty_fp,
-                        score,
                     ])
                     if score > best_iou:
                         best_iou = score
@@ -1572,11 +1455,9 @@ def main():
             best_metric_cfg["gt_area"],
         )
 
-    overall_summary = compute_overall_summary(best_metrics, args.objective)
-    best_metric = float(overall_summary["best_metric"])
-    old5_avg = float(overall_summary["old5_avg"])
-    rare_avg = float(overall_summary["rare_avg"])
-    all11_avg = float(overall_summary["all11_avg"])
+    best_metric = float(np.mean([best_scores[class_name] for class_name in CLASSES])) if CLASSES else 0.0
+    group_scores = compute_group_scores(best_scores)
+    objective_score = compute_objective_score(group_scores, args.objective)
 
     with open(args.output_dir / "best_thresholds.json", "w", encoding="utf-8") as file_obj:
         json.dump(best_thresholds, file_obj, ensure_ascii=False, indent=2)
@@ -1584,19 +1465,8 @@ def main():
         json.dump(best_postprocess, file_obj, ensure_ascii=False, indent=2)
     with open(args.output_dir / "threshold_sweep_summary.csv", "w", newline="", encoding="utf-8") as file_obj:
         writer = csv.writer(file_obj)
-        writer.writerow(["class_name", "threshold", "min_area", "topk_components", "fill_holes", "mean_iou", "precision", "recall", "pred_area", "gt_area", "penalty_fp", "score"])
+        writer.writerow(["class_name", "threshold", "min_area", "topk_components", "fill_holes", "mean_iou", "precision", "recall", "pred_area", "gt_area"])
         writer.writerows(summary_rows)
-
-    thresholds_payload = {
-        "objective": args.objective,
-        "best_metric": best_metric,
-        "old5_avg": old5_avg,
-        "rare_avg": rare_avg,
-        "all11_avg": all11_avg,
-        "prompt_thresholds": best_thresholds,
-        "postprocess": best_postprocess,
-    }
-    save_json(args.output_dir / "thresholds.json", thresholds_payload)
 
     if args.write_back_checkpoint:
         if not isinstance(checkpoint, dict):
@@ -1607,11 +1477,7 @@ def main():
         checkpoint["postprocess"] = best_postprocess
         checkpoint["postprocess_cfg"] = best_postprocess
         checkpoint["sweep_mode"] = args.sweep_mode
-        checkpoint["sweep_objective"] = args.objective
         checkpoint["sweep_metric"] = best_metric
-        checkpoint["old5_avg"] = old5_avg
-        checkpoint["rare_avg"] = rare_avg
-        checkpoint["all11_avg"] = all11_avg
         checkpoint["prompt_fusion_mode"] = args.prompt_fusion_mode
         checkpoint["raw_prompt_weight"] = float(args.raw_prompt_weight)
         checkpoint["prompt_match_mode"] = args.prompt_match_mode
@@ -1624,24 +1490,26 @@ def main():
 
     summary_payload = {
         "sweep_mode": args.sweep_mode,
-        "objective": args.objective,
         "checkpoint": str(args.checkpoint),
         "text_cache_path": str(args.text_cache_path),
         "img_size": img_size,
         "write_back_checkpoint": bool(args.write_back_checkpoint),
         "write_back_path": str(writeback_path) if writeback_path is not None else None,
-        "swept_checkpoint_path": str(writeback_path) if writeback_path is not None else None,
         "max_samples_per_class": args.max_samples_per_class,
+        "objective": args.objective,
         "prompt_prototypes_source": prompt_prototypes_source,
         "prompt_fusion_mode": args.prompt_fusion_mode,
         "raw_prompt_weight": float(args.raw_prompt_weight),
         "prompt_match_mode": args.prompt_match_mode,
         "sample_counts": sample_counts,
         "best_metric": best_metric,
-        "old5_avg": old5_avg,
-        "rare_avg": rare_avg,
-        "all11_avg": all11_avg,
-        "overall_summary": overall_summary,
+        "objective_score": objective_score,
+        "group_scores": group_scores,
+        "all11_avg": float(group_scores.get("all11", 0.0)),
+        "old5_avg": float(group_scores.get("old5", 0.0)),
+        "rare_avg": float(group_scores.get("rare6", 0.0)),
+        "all10_no_window_avg": float(group_scores.get("all10_no_window", 0.0)),
+        "rare_no_window_avg": float(group_scores.get("rare_no_window", 0.0)),
         "best_thresholds": best_thresholds,
         "best_postprocess": best_postprocess,
         "best_scores": best_scores,
@@ -1664,7 +1532,6 @@ def main():
         },
         "best_thresholds_path": str(args.output_dir / "best_thresholds.json"),
         "best_postprocess_path": str(args.output_dir / "best_postprocess.json"),
-        "thresholds_json_path": str(args.output_dir / "thresholds.json"),
         "run_log_path": str(run_log_path),
     }
     save_json(
@@ -1683,19 +1550,16 @@ def main():
         prompt_match_mode=args.prompt_match_mode,
         sample_counts=sample_counts,
         best_metric=best_metric,
-        old5_avg=old5_avg,
-        rare_avg=rare_avg,
-        all11_avg=all11_avg,
         best_thresholds=best_thresholds,
         best_postprocess=best_postprocess,
         best_scores=best_scores,
         best_metrics=best_metrics,
+        group_scores=group_scores,
+        objective_score=objective_score,
         write_back_path=writeback_path,
         threshold_grid=threshold_grid,
         min_area_grid=min_area_grid,
     )
-    sweep_report_path = args.output_dir / "sweep_report.md"
-    sweep_report_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     cache_artifacts = persist_sweep_summary_cache(
         output_dir=args.output_dir,
         cache_dir=DEFAULT_SWEEP_CACHE_DIR,
@@ -1706,7 +1570,6 @@ def main():
     )
     log_sweep_summary(summary_lines)
     LOGGER.info("sweep_run_log: %s", run_log_path)
-    LOGGER.info("sweep_report_md: %s", sweep_report_path)
     LOGGER.info("summary_text_path: %s", cache_artifacts["output_summary_path"])
     LOGGER.info("summary_cache_json: %s", cache_artifacts["cache_json_latest"])
     LOGGER.info("summary_cache_text: %s", cache_artifacts["cache_text_latest"])

@@ -9,6 +9,7 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
+AUTO_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 if str(PROJECT_ROOT) not in sys.path:
@@ -51,7 +52,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Lightweight URF refine-head check")
     parser.add_argument("--ckpt", type=Path, default=None)
     parser.add_argument("--use_refine_head", type=parse_bool, default=True)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default=AUTO_DEVICE)
     args = parser.parse_args()
 
     model_plain = build_model_from_config(build_cfg(use_refine_head=False))

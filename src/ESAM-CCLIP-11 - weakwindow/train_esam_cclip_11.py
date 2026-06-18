@@ -10,7 +10,6 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
 
 ESAM_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ESAM_ROOT.parents[1]
@@ -28,7 +27,7 @@ import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 
-from config_esam_cclip_11_urf import (
+from config_esam_cclip_11 import (
     ALL_JSON,
     AMP,
     apply_preset,
@@ -37,10 +36,6 @@ from config_esam_cclip_11_urf import (
     CLASS_TO_IDX,
     CLASS_WEIGHTS,
     CLASSES,
-    CHECKPOINT_SCORE_ALL11_WEIGHT,
-    CHECKPOINT_SCORE_OLD5_WEIGHT,
-    CHECKPOINT_SCORE_OLD_DROP_PENALTY_WEIGHT,
-    CHECKPOINT_SCORE_RARE_WEIGHT,
     CONF_FILTER,
     DECODER_LR,
     DEVICE,
@@ -66,7 +61,6 @@ from config_esam_cclip_11_urf import (
     NEGATIVE_SAMPLE_RATIO,
     NEGATIVE_SAMPLE_WEIGHT,
     OLD5_CLASSES,
-    OLD_CLASSES,
     OLD_CLASS_SAMPLE_RATIO,
     OUTPUT_ROOT,
     PRESET_CHOICES,
@@ -78,31 +72,32 @@ from config_esam_cclip_11_urf import (
     RARE_BALANCED_RARE_CLASSES,
     RARE_CLASS_KEEP_RATIO,
     RARE_OVERSAMPLE,
-    REFINE_HEAD_HIDDEN_DIM,
-    REFINE_LR,
     REBUILD_IMAGE_CACHE,
     REBUILD_TEXT_CACHE,
     RUN_NAME,
     SEED,
     TEXT_CACHE_PATH,
     TOKENIZER_DIR,
-    TRAIN_REFINE_HEAD,
     TRAIN_DECODER_ONLY,
     TRAIN_JSON,
     TRAIN_LIST,
-    USE_REFINE_HEAD,
     USE_IMAGE_CACHE,
     USE_PROMPT_PROTOTYPE,
     VAL_INCLUDE_NEGATIVE_SAMPLES,
     VAL_JSON,
     VAL_LIST,
     VAL_THRESHOLDS,
+    WEAK3_ENABLED,
+    WEAK3_SEED,
+    WEAK_CLASS_KEEP_RATIO,
+    WEAK_CLASS_LOSS_WEIGHT,
     WEIGHT_DECAY,
     WORKERS,
     WARMUP_EPOCHS,
 )
-from common_esam_cclip_11_urf import (
+from common_esam_cclip_11 import (
     DiceLoss,
+    ESAMCCLIPModel,
     FocalLoss,
     count_parameters,
     compute_metrics,
@@ -111,20 +106,15 @@ from common_esam_cclip_11_urf import (
     resolve_device,
     save_json,
 )
-from dataset_esam_cclip_11_urf import ESAMCCLIP11Dataset
-from model_esam_cclip_11_urf import (
-    build_model_from_config,
-    load_checkpoint_flexible,
-    set_trainable_modules,
-)
-from path_utils_urf import ensure_dir, ensure_file, resolve_project_path
-from prompt_prototypes_urf import load_or_build_text_cache
+from dataset_esam_cclip_11 import ESAMCCLIP11Dataset
+from model_esam_cclip_11 import load_checkpoint_flexible
+from path_utils import ensure_dir, ensure_file, resolve_project_path
+from prompt_prototypes import load_or_build_text_cache
 
 # =========================
 # Logging
 # =========================
 LOGGER = logging.getLogger("ESAM_CCLIP_11")
-AUTO_DEVICE = DEVICE if DEVICE else ("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def configure_logging(log_path: Path):
@@ -140,150 +130,6 @@ def configure_logging(log_path: Path):
     LOGGER.addHandler(stream_handler)
 
 
-def _json_safe(value: Any):
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, defaultdict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def _str2bool(value):
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise ValueError(f"无法解析布尔值: {value}")
-
-
-def parse_rare_oversample_arg(value):
-    if value is None or isinstance(value, (dict, int, float)):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.startswith("{"):
-        return json.loads(text)
-    try:
-        return float(text)
-    except ValueError:
-        return json.loads(text)
-
-
-def load_config_payload(config_path: Optional[Path]) -> Dict[str, Any]:
-    if config_path is None:
-        return {}
-    config_path = Path(config_path)
-    with open(config_path, "r", encoding="utf-8") as file_obj:
-        payload = json.load(file_obj)
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"--config 必须是 JSON object: {config_path}")
-    return payload
-
-
-def _build_action_map(parser):
-    return {action.dest: action for action in parser._actions if getattr(action, "dest", None)}
-
-
-def _coerce_config_value(action, value):
-    if value is None:
-        return None
-    if action is None:
-        return value
-    if getattr(action, "type", None) is Path:
-        return Path(value)
-    if getattr(action, "type", None) is not None:
-        return action.type(value)
-    if isinstance(action.default, bool):
-        return _str2bool(value)
-    return value
-
-
-def apply_config_overrides(args, parser, config_payload, explicit_dests=None):
-    explicit_dests = set(explicit_dests or [])
-    action_map = _build_action_map(parser)
-    alias_map = {
-        "num_workers": "workers",
-    }
-    for raw_key, raw_value in config_payload.items():
-        dest = alias_map.get(raw_key, raw_key)
-        if dest in explicit_dests or not hasattr(args, dest):
-            continue
-        action = action_map.get(dest)
-        value = parse_rare_oversample_arg(raw_value) if dest == "rare_oversample" else _coerce_config_value(action, raw_value)
-        setattr(args, dest, value)
-    return args
-
-
-def prepare_run_dir(output_dir: Path, run_name: str) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    base_dir = output_dir / run_name
-    if not base_dir.exists():
-        base_dir.mkdir(parents=True, exist_ok=False)
-        return base_dir
-
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    for suffix_idx in range(100):
-        suffix = f"_{timestamp}" if suffix_idx == 0 else f"_{timestamp}_{suffix_idx:02d}"
-        candidate = output_dir / f"{run_name}{suffix}"
-        if candidate.exists():
-            continue
-        candidate.mkdir(parents=True, exist_ok=False)
-        return candidate
-    raise RuntimeError(f"无法为输出目录创建唯一子目录: {base_dir}")
-
-
-def infer_trainable_modules(args, trainable_info: Optional[Dict[str, Any]], model) -> Tuple[list, int]:
-    modules = []
-    if any(param.requires_grad for _, param in model.decoder.named_parameters()):
-        modules.append("decoder")
-    if args.use_refine_head and any(param.requires_grad for _, param in model.refine_head.named_parameters()):
-        modules.append("refine_head")
-    if getattr(args, "unfreeze_image_mode", "none") != "none":
-        modules.append(f"image_encoder:{args.unfreeze_image_mode}")
-    if any(param.requires_grad for _, param in model.txt_encoder.named_parameters()):
-        modules.append("text_encoder")
-    if trainable_info and trainable_info.get("warnings"):
-        modules.extend([f"warning:{item}" for item in trainable_info["warnings"]])
-    trainable_param_count = sum(param.numel() for param in model.parameters() if param.requires_grad)
-    return modules, int(trainable_param_count)
-
-
-def save_metrics_snapshot(run_dir: Path, epoch: int, history, best_metrics, train_stats, val_metrics, args):
-    payload = {
-        "epoch": int(epoch),
-        "preset": args.preset,
-        "run_name": args.run_name,
-        "output_dir": str(run_dir),
-        "use_refine_head": bool(args.use_refine_head),
-        "resume_from": getattr(args, "resume_from", None),
-        "trainable_modules": list(getattr(args, "trainable_modules", [])),
-        "trainable_parameter_count": int(getattr(args, "trainable_parameter_count", 0)),
-        "negative_sample_ratio": float(args.negative_sample_ratio),
-        "negative_sample_weight": float(args.negative_sample_weight),
-        "old_class_sample_ratio": float(args.old_class_sample_ratio),
-        "rare_class_keep_ratio": float(args.rare_class_keep_ratio),
-        "rare_oversample": _json_safe(args.rare_oversample),
-        "class_loss_weight": _json_safe(args.class_weights),
-        "reference_old5": float(args.reference_old5),
-        "reference_old5_source": str(getattr(args, "reference_old5_source", "none")),
-        "train": _json_safe(train_stats),
-        "val": _json_safe(val_metrics),
-        "best_metrics": _json_safe(best_metrics),
-        "history": _json_safe(history),
-    }
-    save_json(run_dir / "metrics.json", payload)
-
-
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -294,7 +140,6 @@ def set_seed(seed: int):
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="ESAM-CCLIP-11 fast finetune")
-    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--preset", choices=PRESET_CHOICES, default="base")
     parser.add_argument("--train_json", type=Path, default=TRAIN_JSON)
     parser.add_argument("--val_json", type=Path, default=VAL_JSON)
@@ -306,13 +151,12 @@ def build_argparser():
     parser.add_argument("--efficient_sam_ckpt", type=Path, default=EFFICIENT_SAM_CKPT)
     parser.add_argument("--output_dir", type=Path, default=OUTPUT_ROOT)
     parser.add_argument("--run_name", type=str, default=RUN_NAME)
-    parser.add_argument("--device", type=str, default=AUTO_DEVICE)
+    parser.add_argument("--device", type=str, default=DEVICE)
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--esam_input_size", type=int, default=ESAM_INPUT_SIZE)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--workers", type=int, default=WORKERS)
-    parser.add_argument("--num_workers", dest="workers", type=int)
     parser.add_argument("--no_val", action="store_true", default=False)
     parser.add_argument("--with_val", dest="no_val", action="store_false")
     parser.add_argument("--no_train_split_filter", action="store_true", default=False)
@@ -330,19 +174,9 @@ def build_argparser():
     parser.add_argument("--no_auto_resume", action="store_true", default=False)
     parser.add_argument("--freeze_image_encoder", dest="freeze_image_encoder", action="store_true")
     parser.add_argument("--unfreeze_image_encoder", dest="freeze_image_encoder", action="store_false")
-    parser.add_argument("--partial_unfreeze_image_encoder", dest="partial_unfreeze_image_encoder", action="store_true")
-    parser.add_argument("--no_partial_unfreeze_image_encoder", dest="partial_unfreeze_image_encoder", action="store_false")
     parser.add_argument("--unfreeze_image_mode", choices=["none", "last_norm", "last1", "last2"], default="none")
     parser.add_argument("--freeze_text_encoder", action="store_true", default=FREEZE_TEXT_ENCODER)
     parser.add_argument("--train_decoder_only", action="store_true", default=TRAIN_DECODER_ONLY)
-    parser.add_argument("--use_refine_head", dest="use_refine_head", action="store_true")
-    parser.add_argument("--no_use_refine_head", dest="use_refine_head", action="store_false")
-    parser.add_argument("--train_refine_head", dest="train_refine_head", action="store_true")
-    parser.add_argument("--freeze_refine_head", dest="train_refine_head", action="store_false")
-    parser.add_argument("--refine_lr", type=float, default=REFINE_LR)
-    parser.add_argument("--refine_head_hidden_dim", type=int, default=REFINE_HEAD_HIDDEN_DIM)
-    parser.add_argument("--pipeline_name", type=str, default="")
-    parser.add_argument("--pipeline_stage", type=str, default="")
     parser.add_argument("--print_trainable_params", dest="print_trainable_params", action="store_true")
     parser.add_argument("--no_print_trainable_params", dest="print_trainable_params", action="store_false")
     parser.add_argument("--use_prompt_prototype", dest="use_prompt_prototype", action="store_true")
@@ -362,7 +196,9 @@ def build_argparser():
     parser.add_argument("--rebuild_image_cache", action="store_true", default=REBUILD_IMAGE_CACHE)
     parser.add_argument("--negative_sample_ratio", type=float, default=NEGATIVE_SAMPLE_RATIO)
     parser.add_argument("--negative_sample_weight", type=float, default=NEGATIVE_SAMPLE_WEIGHT)
-    parser.add_argument("--rare_oversample", type=parse_rare_oversample_arg, default=RARE_OVERSAMPLE)
+    parser.add_argument("--disabled_train_classes", nargs="*", default=None)
+    parser.add_argument("--class_keep_ratio_json", type=str, default=None)
+    parser.add_argument("--class_loss_scale_json", type=str, default=None)
     parser.add_argument("--old_class_sample_ratio", type=float, default=OLD_CLASS_SAMPLE_RATIO)
     parser.add_argument("--rare_class_keep_ratio", type=float, default=RARE_CLASS_KEEP_RATIO)
     parser.add_argument("--rare_balance_enabled", dest="rare_balance_enabled", action="store_true")
@@ -374,12 +210,10 @@ def build_argparser():
     parser.add_argument("--decoder_lr", type=float, default=DECODER_LR)
     parser.add_argument("--image_lr", type=float, default=IMAGE_LR)
     parser.add_argument("--text_lr", type=float, default=0.0)
-    parser.add_argument("--grad_clip", type=float, default=GRAD_CLIP)
     parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--warmup_epochs", type=int, default=WARMUP_EPOCHS)
     parser.add_argument("--min_lr_ratio", type=float, default=MIN_LR_RATIO)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--reference_old5", type=float, default=-1.0)
     parser.set_defaults(
         amp=AMP,
         freeze_image_encoder=FREEZE_IMAGE_ENCODER,
@@ -389,9 +223,6 @@ def build_argparser():
         augment_prompt=False,
         prompt_alias_train=False,
         val_augment_prompt=False,
-        use_refine_head=USE_REFINE_HEAD,
-        train_refine_head=TRAIN_REFINE_HEAD,
-        partial_unfreeze_image_encoder=False,
     )
     return parser
 
@@ -409,9 +240,61 @@ def collect_explicit_dests(parser, argv):
     return explicit_dests
 
 
+def parse_class_float_mapping(raw_text, arg_name):
+    if raw_text is None:
+        return None
+    payload = json.loads(raw_text)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{arg_name} must be a JSON object")
+    return {str(key): float(value) for key, value in payload.items()}
+
+
+def normalize_weakwindow_args(args):
+    if getattr(args, "class_keep_ratio_json", None) is not None:
+        args.class_keep_ratio = parse_class_float_mapping(args.class_keep_ratio_json, "--class_keep_ratio_json")
+    elif not hasattr(args, "class_keep_ratio") or args.class_keep_ratio is None:
+        args.class_keep_ratio = {}
+    else:
+        args.class_keep_ratio = {str(key): float(value) for key, value in dict(args.class_keep_ratio).items()}
+
+    if getattr(args, "class_loss_scale_json", None) is not None:
+        args.class_loss_scale = parse_class_float_mapping(args.class_loss_scale_json, "--class_loss_scale_json")
+    elif not hasattr(args, "class_loss_scale") or args.class_loss_scale is None:
+        args.class_loss_scale = {}
+    else:
+        args.class_loss_scale = {str(key): float(value) for key, value in dict(args.class_loss_scale).items()}
+
+    if not hasattr(args, "disabled_train_classes") or args.disabled_train_classes is None:
+        args.disabled_train_classes = []
+    else:
+        args.disabled_train_classes = [str(name) for name in list(args.disabled_train_classes)]
+    return args
+
+
+def normalize_weak3_args(args):
+    if not hasattr(args, "weak3_enabled"):
+        args.weak3_enabled = bool(WEAK3_ENABLED)
+    else:
+        args.weak3_enabled = bool(args.weak3_enabled)
+
+    if not hasattr(args, "weak3_seed") or args.weak3_seed is None:
+        args.weak3_seed = int(WEAK3_SEED)
+    else:
+        args.weak3_seed = int(args.weak3_seed)
+
+    if not hasattr(args, "weak_class_keep_ratio") or args.weak_class_keep_ratio is None:
+        args.weak_class_keep_ratio = dict(WEAK_CLASS_KEEP_RATIO)
+    else:
+        args.weak_class_keep_ratio = {str(key): float(value) for key, value in dict(args.weak_class_keep_ratio).items()}
+
+    if not hasattr(args, "weak_class_loss_weight") or args.weak_class_loss_weight is None:
+        args.weak_class_loss_weight = dict(WEAK_CLASS_LOSS_WEIGHT)
+    else:
+        args.weak_class_loss_weight = {str(key): float(value) for key, value in dict(args.weak_class_loss_weight).items()}
+    return args
+
+
 def resolve_runtime_paths(args):
-    if args.config is not None:
-        args.config = ensure_file(args.config, "config")
     args.train_json = ensure_file(args.train_json, "train_json")
     args.all_json = resolve_project_path(args.all_json)
     args.image_root = ensure_dir(args.image_root, "image_root")
@@ -437,8 +320,6 @@ def resolve_runtime_paths(args):
 
 
 def normalize_unfreeze_args(args):
-    if getattr(args, "partial_unfreeze_image_encoder", False) and args.unfreeze_image_mode == "none":
-        args.unfreeze_image_mode = "last_norm"
     if args.unfreeze_image_mode == "none":
         args.freeze_image_encoder = True
         args.image_lr = 0.0
@@ -446,8 +327,6 @@ def normalize_unfreeze_args(args):
         args.freeze_image_encoder = False
         if args.image_lr <= 0:
             args.image_lr = 1e-6
-    if not args.use_refine_head:
-        args.train_refine_head = False
     return args
 
 
@@ -466,6 +345,10 @@ def collate_fn(batch):
 
 def build_datasets(args):
     effective_hflip_prob = 0.0 if args.use_image_cache else HFLIP_PROB
+    LOGGER.info("[WeakWindow] disabled_train_classes=%s", args.disabled_train_classes)
+    LOGGER.info("[WeakWindow] class_keep_ratio=%s", args.class_keep_ratio)
+    LOGGER.info("[WeakWindow] class_loss_scale=%s", args.class_loss_scale)
+    LOGGER.info("[WeakWindow] val keeps all classes")
     LOGGER.info("开始构建训练集: %s", args.train_json)
     train_dataset = ESAMCCLIP11Dataset(
         annotation_json=args.train_json,
@@ -481,6 +364,13 @@ def build_datasets(args):
         negative_sample_prob=args.negative_sample_ratio if INCLUDE_NEGATIVE_SAMPLES else 0.0,
         negative_sample_weight=args.negative_sample_weight,
         rare_oversample=args.rare_oversample,
+        weak3_enabled=args.weak3_enabled,
+        weak3_seed=args.weak3_seed,
+        weak_class_keep_ratio=args.weak_class_keep_ratio,
+        weak_class_loss_weight=args.weak_class_loss_weight,
+        disabled_train_classes=args.disabled_train_classes,
+        class_keep_ratio=args.class_keep_ratio,
+        class_loss_scale=args.class_loss_scale,
         old_class_sample_ratio=args.old_class_sample_ratio,
         rare_class_keep_ratio=args.rare_class_keep_ratio,
         old_classes=args.old_classes,
@@ -508,6 +398,10 @@ def build_datasets(args):
             negative_sample_prob=0.0,
             negative_sample_weight=0.0,
             rare_oversample=None,
+            weak3_enabled=False,
+            weak3_seed=args.weak3_seed,
+            weak_class_keep_ratio={},
+            weak_class_loss_weight={},
             old_class_sample_ratio=1.0,
             rare_class_keep_ratio=1.0,
             old_classes=args.old_classes,
@@ -526,8 +420,8 @@ def build_datasets(args):
     return train_dataset, val_dataset
 
 
-def build_optimizer(model, decoder_lr, image_lr, text_lr, refine_lr, weight_decay):
-    image_params, text_params, decoder_params, refine_params, other_params = [], [], [], [], []
+def build_optimizer(model, decoder_lr, image_lr, text_lr, weight_decay):
+    image_params, text_params, decoder_params, other_params = [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -537,15 +431,11 @@ def build_optimizer(model, decoder_lr, image_lr, text_lr, refine_lr, weight_deca
             text_params.append(param)
         elif name.startswith("decoder"):
             decoder_params.append(param)
-        elif name.startswith("refine_head"):
-            refine_params.append(param)
         else:
             other_params.append(param)
     param_groups = []
     if decoder_params:
         param_groups.append({"params": decoder_params, "lr": decoder_lr, "weight_decay": weight_decay, "name": "decoder"})
-    if refine_params:
-        param_groups.append({"params": refine_params, "lr": refine_lr, "weight_decay": weight_decay, "name": "refine"})
     if image_params and image_lr > 0:
         param_groups.append({"params": image_params, "lr": image_lr, "weight_decay": weight_decay, "name": "image"})
     if text_params and text_lr > 0:
@@ -554,15 +444,13 @@ def build_optimizer(model, decoder_lr, image_lr, text_lr, refine_lr, weight_deca
         param_groups.append({"params": other_params, "lr": decoder_lr, "weight_decay": weight_decay, "name": "other"})
     if not param_groups:
         raise RuntimeError("没有可训练参数，请检查冻结设置。")
-    LOGGER.info("[ParamGroupSummary] decoder_groups=%d refine_groups=%d image_groups=%d text_groups=%d other_groups=%d",
+    LOGGER.info("[ParamGroupSummary] decoder_groups=%d image_groups=%d text_groups=%d other_groups=%d",
                 1 if decoder_params else 0,
-                1 if refine_params else 0,
                 1 if image_params and image_lr > 0 else 0,
                 1 if text_params and text_lr > 0 else 0,
                 1 if other_params else 0)
-    LOGGER.info("[ParamGroupSummary] decoder_params=%.2fM refine_params=%.2fM image_params=%.2fM text_params=%.2fM other_params=%.2fM",
+    LOGGER.info("[ParamGroupSummary] decoder_params=%.2fM image_params=%.2fM text_params=%.2fM other_params=%.2fM",
                 sum(p.numel() for p in decoder_params) / 1e6,
-                sum(p.numel() for p in refine_params) / 1e6,
                 sum(p.numel() for p in image_params) / 1e6,
                 sum(p.numel() for p in text_params) / 1e6,
                 sum(p.numel() for p in other_params) / 1e6)
@@ -592,15 +480,13 @@ def _extract_last_block_prefixes(param_names, block_token: str):
     return [unique[idx] for idx in sorted(unique.keys())]
 
 
-def set_partial_image_encoder_trainable(model, mode: str, train_refine_head: bool = False):
+def set_partial_image_encoder_trainable(model, mode: str):
     for param in model.txt_encoder.parameters():
         param.requires_grad = False
     for param in model.img_encoder.parameters():
         param.requires_grad = False
     for param in model.decoder.parameters():
         param.requires_grad = True
-    for param in model.refine_head.parameters():
-        param.requires_grad = bool(train_refine_head)
 
     warnings = []
     matched_names = []
@@ -655,7 +541,6 @@ def log_trainable_parameter_summary(model, args):
     trainable_names = []
     image_trainable_names = []
     decoder_trainable_names = []
-    refine_trainable_names = []
     text_trainable_names = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -665,25 +550,18 @@ def log_trainable_parameter_summary(model, args):
             image_trainable_names.append(name)
         elif name.startswith("decoder"):
             decoder_trainable_names.append(name)
-        elif name.startswith("refine_head"):
-            refine_trainable_names.append(name)
         elif name.startswith("txt_encoder"):
             text_trainable_names.append(name)
 
     total_params, trainable_params = count_parameters(model)
     image_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("img_encoder")) / 1e6
     decoder_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("decoder")) / 1e6
-    refine_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("refine_head")) / 1e6
     text_trainable_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and n.startswith("txt_encoder")) / 1e6
 
     LOGGER.info("unfreeze_image_mode=%s", args.unfreeze_image_mode)
     LOGGER.info("image_lr=%s", args.image_lr)
-    LOGGER.info("use_refine_head=%s", args.use_refine_head)
-    LOGGER.info("train_refine_head=%s", args.train_refine_head)
-    LOGGER.info("refine_lr=%s", args.refine_lr)
     LOGGER.info("trainable total params=%.2fM", trainable_params)
     LOGGER.info("trainable decoder params=%.2fM", decoder_trainable_params)
-    LOGGER.info("trainable refine_head params=%.2fM", refine_trainable_params)
     LOGGER.info("trainable image_encoder params=%.2fM", image_trainable_params)
     LOGGER.info("trainable text_encoder params=%.2fM", text_trainable_params)
     preview = trainable_names[:50]
@@ -785,20 +663,7 @@ def encode_images_with_optional_cache(model, images, image_paths, cache_dir, use
     return torch.stack(features, dim=0).to(images.device), hit_count, failed
 
 
-def train_one_epoch(
-    model,
-    loader,
-    optimizer,
-    scheduler,
-    criterion_dice,
-    criterion_focal,
-    scaler,
-    device,
-    text_cache_payload,
-    args,
-    epoch=None,
-    total_epochs=None,
-):
+def train_one_epoch(model, loader, optimizer, scheduler, criterion_dice, criterion_focal, scaler, device, text_cache_payload, args):
     model.train()
     if args.freeze_image_encoder:
         model.img_encoder.eval()
@@ -809,10 +674,7 @@ def train_one_epoch(
     cache_total = 0
     failed_cache_items = []
     start = time.time()
-    train_desc = "Train"
-    if epoch is not None and total_epochs is not None:
-        train_desc = f"Train {epoch}/{total_epochs}"
-    iterator = maybe_tqdm(loader, total=len(loader), desc=train_desc, leave=True)
+    iterator = maybe_tqdm(loader, total=len(loader), desc="Train", leave=False)
     for batch in iterator:
         batch_start = time.time()
         images = batch["images"].to(device, non_blocking=True)
@@ -844,13 +706,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=args.amp and device.type == "cuda"):
-            logits = model.decode(
-                image_features=image_features,
-                text_features=text_features,
-                target_size=(args.img_size, args.img_size),
-                images=images,
-                use_refine_head=args.use_refine_head,
-            )
+            logits = model.decode(image_features=image_features, text_features=text_features, target_size=(args.img_size, args.img_size))
             bce_map = F.binary_cross_entropy_with_logits(logits, masks, reduction="none").mean(dim=(1, 2, 3))
             dice_val = torch.stack([criterion_dice(logits[i: i + 1], masks[i: i + 1]) for i in range(logits.size(0))], dim=0).view(-1)
             focal_val = torch.stack([criterion_focal(logits[i: i + 1], masks[i: i + 1]) for i in range(logits.size(0))], dim=0).view(-1)
@@ -860,7 +716,7 @@ def train_one_epoch(
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         scaler.step(optimizer)
         scaler.update()
         if scheduler is not None:
@@ -872,18 +728,10 @@ def train_one_epoch(
         running["focal"] += focal_val.mean().item()
         running["batch_time"] += (time.time() - batch_start)
         if hasattr(iterator, "set_postfix"):
-            current_lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
-            hit_rate = float(cache_hits / max(cache_total, 1)) if cache_total > 0 else 0.0
-            iterator.set_postfix(
-                loss=f"{loss.item():.4f}",
-                bce=f"{bce_map.mean().item():.4f}",
-                dice=f"{dice_val.mean().item():.4f}",
-                lr=f"{current_lr:.2e}",
-                cache=f"{100.0 * hit_rate:.1f}%",
-            )
+            iterator.set_postfix(loss=f"{loss.item():.4f}")
 
     if failed_cache_items:
-        save_json(args.run_dir / "failed_image_cache.json", failed_cache_items)
+        save_json(args.output_dir / args.run_name / "failed_image_cache.json", failed_cache_items)
     denom = max(len(loader), 1)
     running["loss"] /= denom
     running["bce"] /= denom
@@ -900,7 +748,7 @@ def validate(model, loader, criterion_dice, criterion_focal, device, text_cache_
     model.eval()
     metrics = defaultdict(list)
     start = time.time()
-    iterator = maybe_tqdm(loader, total=len(loader), desc="Val", leave=True)
+    iterator = maybe_tqdm(loader, total=len(loader), desc="Val", leave=False)
     for batch in iterator:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
@@ -908,25 +756,13 @@ def validate(model, loader, criterion_dice, criterion_focal, device, text_cache_
         image_features = model.encode_image(images)
         text_features = get_text_features(class_names, text_cache_payload, device)
         with autocast(enabled=args.amp and device.type == "cuda"):
-            logits = model.decode(
-                image_features=image_features,
-                text_features=text_features,
-                target_size=(args.img_size, args.img_size),
-                images=images,
-                use_refine_head=args.use_refine_head,
-            )
+            logits = model.decode(image_features=image_features, text_features=text_features, target_size=(args.img_size, args.img_size))
         bce_map = F.binary_cross_entropy_with_logits(logits, masks, reduction="none").mean(dim=(1, 2, 3))
         dice_val = torch.stack([criterion_dice(logits[i: i + 1], masks[i: i + 1]) for i in range(logits.size(0))], dim=0).view(-1)
         focal_val = torch.stack([criterion_focal(logits[i: i + 1], masks[i: i + 1]) for i in range(logits.size(0))], dim=0).view(-1)
         metrics["bce"].append(float(bce_map.mean().item()))
         metrics["dice_loss"].append(float(dice_val.mean().item()))
         metrics["focal"].append(float(focal_val.mean().item()))
-        if hasattr(iterator, "set_postfix"):
-            iterator.set_postfix(
-                bce=f"{bce_map.mean().item():.4f}",
-                dice=f"{dice_val.mean().item():.4f}",
-                focal=f"{focal_val.mean().item():.4f}",
-            )
         for idx, class_name in enumerate(class_names):
             score = compute_metrics(logits[idx: idx + 1], masks[idx: idx + 1], threshold=VAL_THRESHOLDS.get(class_name, 0.5))
             metrics["iou/overall"].append(score["iou"])
@@ -947,32 +783,6 @@ def validate(model, loader, criterion_dice, criterion_focal, device, text_cache_
     summary = {key: float(np.mean(values)) for key, values in metrics.items() if values}
     summary["val_time"] = time.time() - start
     return summary
-
-
-def compute_old_drop_penalty(current_old5: float, reference_old5: Optional[float]) -> float:
-    if reference_old5 is None or reference_old5 < 0:
-        return 0.0
-    return max(0.0, float(reference_old5) - float(current_old5)) * float(CHECKPOINT_SCORE_OLD_DROP_PENALTY_WEIGHT)
-
-
-def compute_selection_score(current_all11: float, current_old5: float, current_rare: float, reference_old5: Optional[float]) -> Tuple[float, float]:
-    old_drop_penalty = compute_old_drop_penalty(current_old5=current_old5, reference_old5=reference_old5)
-    score = (
-        float(CHECKPOINT_SCORE_OLD5_WEIGHT) * float(current_old5)
-        + float(CHECKPOINT_SCORE_RARE_WEIGHT) * float(current_rare)
-        + float(CHECKPOINT_SCORE_ALL11_WEIGHT) * float(current_all11)
-        - old_drop_penalty
-    )
-    return float(score), float(old_drop_penalty)
-
-
-def resolve_score_reference_old5(args, best_metrics) -> Tuple[Optional[float], str]:
-    if float(args.reference_old5) >= 0:
-        return float(args.reference_old5), "cli"
-    best_old5 = best_metrics.get("best_old5", -1.0)
-    if best_old5 is not None and float(best_old5) >= 0:
-        return float(best_old5), "run_best"
-    return None, "none"
 
 
 def plot_results(history, save_path, no_val=False):
@@ -1031,7 +841,7 @@ def evaluate_train_diagnostic(model, loader, device):
         }
         for class_name in CLASSES
     }
-    iterator = maybe_tqdm(loader, total=len(loader), desc="TrainDiag", leave=True)
+    iterator = maybe_tqdm(loader, total=len(loader), desc="TrainDiag", leave=False)
     for batch in iterator:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
@@ -1045,8 +855,6 @@ def evaluate_train_diagnostic(model, loader, device):
             image_features=image_features,
             text_features=text_features,
             target_size=(loader.diag_img_size, loader.diag_img_size),
-            images=images,
-            use_refine_head=getattr(model, "use_refine_head", False),
         )
         for idx, class_name in enumerate(class_names):
             threshold = VAL_THRESHOLDS.get(class_name, 0.5)
@@ -1065,9 +873,6 @@ def evaluate_train_diagnostic(model, loader, device):
             per_class[class_name]["recall"].append(score["recall"])
             per_class[class_name]["pred_area"].append(score["pred_area"])
             per_class[class_name]["gt_area"].append(score["gt_area"])
-        if hasattr(iterator, "set_postfix"):
-            running_iou = float(np.mean(metrics["iou/overall"])) if metrics["iou/overall"] else 0.0
-            iterator.set_postfix(iou=f"{running_iou:.4f}")
 
     summary = {
         "train_mIoU_all11_on_pseudo": float(np.mean(metrics["iou/overall"])) if metrics["iou/overall"] else 0.0,
@@ -1117,8 +922,6 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "best_metrics": best_metrics,
         "history": dict(history),
         "classes": CLASSES,
-        "old_classes": list(OLD_CLASSES),
-        "rare_classes": list(RARE_CLASSES),
         "num_classes": len(CLASSES),
         "class_to_idx": CLASS_TO_IDX,
         "idx_to_class": {idx: cls for idx, cls in enumerate(CLASSES)},
@@ -1130,9 +933,15 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "val_thresholds": VAL_THRESHOLDS,
         "postprocess": POSTPROCESS_DEFAULT,
         "postprocess_cfg": POSTPROCESS_DEFAULT,
-        "class_loss_weight": args.class_weights,
         "class_weights": args.class_weights,
         "rare_oversample": args.rare_oversample,
+        "weak3_enabled": args.weak3_enabled,
+        "weak3_seed": args.weak3_seed,
+        "weak_class_keep_ratio": args.weak_class_keep_ratio,
+        "weak_class_loss_weight": args.weak_class_loss_weight,
+        "disabled_train_classes": args.disabled_train_classes,
+        "class_keep_ratio": args.class_keep_ratio,
+        "class_loss_scale": args.class_loss_scale,
         "negative_sample_ratio": args.negative_sample_ratio,
         "negative_sample_weight": args.negative_sample_weight,
         "old_class_sample_ratio": args.old_class_sample_ratio,
@@ -1148,23 +957,6 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, history, best_metr
         "run_name": args.run_name,
         "unfreeze_image_mode": args.unfreeze_image_mode,
         "image_lr": float(args.image_lr),
-        "grad_clip": float(args.grad_clip),
-        "reference_old5": float(args.reference_old5),
-        "reference_old5_source": str(getattr(args, "reference_old5_source", "none")),
-        "use_refine_head": bool(args.use_refine_head),
-        "train_refine_head": bool(args.train_refine_head),
-        "refine_lr": float(args.refine_lr),
-        "refine_head_hidden_dim": int(args.refine_head_hidden_dim),
-        "resume_from": getattr(args, "resume_from", None),
-        "stage": str(getattr(args, "stage", "")),
-        "trainable_modules": list(getattr(args, "trainable_modules", [])),
-        "trainable_parameter_count": int(getattr(args, "trainable_parameter_count", 0)),
-        "pipeline_name": str(args.pipeline_name),
-        "pipeline_stage": str(args.pipeline_stage),
-        "checkpoint_score_old5_weight": float(CHECKPOINT_SCORE_OLD5_WEIGHT),
-        "checkpoint_score_rare_weight": float(CHECKPOINT_SCORE_RARE_WEIGHT),
-        "checkpoint_score_all11_weight": float(CHECKPOINT_SCORE_ALL11_WEIGHT),
-        "checkpoint_score_old_drop_penalty_weight": float(CHECKPOINT_SCORE_OLD_DROP_PENALTY_WEIGHT),
     }
     torch.save(payload, path)
 
@@ -1192,13 +984,12 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
     load_info = getattr(model, "_last_checkpoint_load_info", {})
     LOGGER.info("resume checkpoint path=%s", load_info.get("checkpoint_path", checkpoint_path))
     LOGGER.info("resume decoder_matched_keys=%d", len(load_info.get("decoder_matched_keys", [])))
-    LOGGER.info("resume refine_head_matched_keys=%d", len(load_info.get("refine_head_matched_keys", [])))
     LOGGER.info("resume missing_keys=%s", missing_keys[:30])
     LOGGER.info("resume unexpected_keys=%s", unexpected_keys[:30])
 
     if args.resume_weights_only:
         LOGGER.info("resume_weights_only=True，仅恢复模型权重，不恢复 optimizer/scheduler/epoch/history。")
-        return 1, defaultdict(list), {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_score": -1.0}, checkpoint
+        return 1, defaultdict(list), {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0}, checkpoint
 
     optimizer_state = checkpoint.get("optimizer_state_dict")
     if optimizer_state:
@@ -1209,7 +1000,7 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
 
     if args.reset_history:
         history = defaultdict(list)
-        best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_score": -1.0}
+        best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0}
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         LOGGER.info("reset_history=True，已清空 history/best_metrics，从 epoch %d 继续训练。", start_epoch)
     else:
@@ -1219,9 +1010,9 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
             history[key] = list(values)
         best_metrics = checkpoint.get(
             "best_metrics",
-            {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_score": -1.0},
+            {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_rescue": -1.0},
         )
-        best_metrics.setdefault("best_score", -1.0)
+        best_metrics.setdefault("best_rescue", -1.0)
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         LOGGER.info("已恢复 epoch=%d, 下一轮从 epoch %d 开始。", int(checkpoint.get("epoch", 0)), start_epoch)
 
@@ -1231,18 +1022,14 @@ def resume_training_state(model, optimizer, scheduler, checkpoint_path, device, 
 def main():
     parser = build_argparser()
     explicit_dests = collect_explicit_dests(parser, sys.argv[1:])
-    args = parser.parse_args()
-    config_payload = load_config_payload(args.config)
-    args = apply_config_overrides(args, parser, config_payload, explicit_dests)
-    args = apply_preset(args, explicit_dests)
+    args = apply_preset(parser.parse_args(), explicit_dests)
+    args = normalize_weakwindow_args(args)
+    args = normalize_weak3_args(args)
     args = resolve_runtime_paths(args)
     args = normalize_unfreeze_args(args)
     args.output_dir = args.output_dir.resolve()
-    run_dir = prepare_run_dir(args.output_dir, args.run_name)
-    args.run_dir = run_dir
-    args.stage = str(args.pipeline_stage or args.preset)
-    args.num_workers = args.workers
-    configure_logging(run_dir / "train_log.txt")
+    run_dir = args.output_dir / args.run_name
+    configure_logging(run_dir / f"{args.run_name}.log")
     set_seed(args.seed)
     device = resolve_device(args.device)
     if args.use_image_cache and not args.freeze_image_encoder:
@@ -1250,18 +1037,9 @@ def main():
     if args.use_image_cache:
         LOGGER.info("use_image_cache=True，训练阶段已强制关闭随机 hflip。")
 
-    resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
-    args.resume_from = None
-    if resume_checkpoint_path is not None:
-        args.resume_from = str(resume_checkpoint_path)
-    elif args.resume_best is not None:
-        args.resume_from = str(args.resume_best)
-
     LOGGER.info("preset=%s", args.preset)
-    LOGGER.info("output_dir=%s", run_dir)
     LOGGER.info("run_name=%s", args.run_name)
     LOGGER.info("resume_best=%s", args.resume_best)
-    LOGGER.info("resume path=%s", args.resume_from)
     LOGGER.info("train_json=%s", args.train_json)
     LOGGER.info("val_json=%s", args.val_json)
     LOGGER.info("train_list=%s", args.train_list)
@@ -1274,10 +1052,6 @@ def main():
     LOGGER.info("freeze_image_encoder=%s", args.freeze_image_encoder)
     LOGGER.info("freeze_text_encoder=%s", args.freeze_text_encoder)
     LOGGER.info("train_decoder_only=%s", args.train_decoder_only)
-    LOGGER.info("use_refine_head=%s", args.use_refine_head)
-    LOGGER.info("train_refine_head=%s", args.train_refine_head)
-    LOGGER.info("refine_head_hidden_dim=%s", args.refine_head_hidden_dim)
-    LOGGER.info("pipeline_name=%s pipeline_stage=%s", args.pipeline_name, args.pipeline_stage)
     LOGGER.info("unfreeze_image_mode=%s", args.unfreeze_image_mode)
     LOGGER.info("print_trainable_params=%s", args.print_trainable_params)
     LOGGER.info("use_prompt_prototype=%s", args.use_prompt_prototype)
@@ -1288,26 +1062,25 @@ def main():
     LOGGER.info("use_image_cache=%s", args.use_image_cache)
     LOGGER.info("text_cache_path=%s", args.text_cache_path)
     LOGGER.info("epochs=%s", args.epochs)
-    LOGGER.info(
-        "decoder_lr=%s refine_lr=%s image_lr=%s text_lr=%s",
-        args.decoder_lr,
-        args.refine_lr,
-        args.image_lr,
-        args.text_lr,
-    )
+    LOGGER.info("decoder_lr=%s image_lr=%s text_lr=%s", args.decoder_lr, args.image_lr, args.text_lr)
     LOGGER.info("warmup_epochs=%s", args.warmup_epochs)
     LOGGER.info("min_lr_ratio=%s", args.min_lr_ratio)
-    LOGGER.info("grad_clip=%s", args.grad_clip)
     LOGGER.info("current classes=%s", CLASSES)
     LOGGER.info("negative_sample_ratio=%s", args.negative_sample_ratio)
     LOGGER.info("negative_sample_weight=%s", args.negative_sample_weight)
+    LOGGER.info("weak3_enabled=%s", args.weak3_enabled)
+    LOGGER.info("weak3_seed=%s", args.weak3_seed)
+    LOGGER.info("weak_class_keep_ratio=%s", args.weak_class_keep_ratio)
+    LOGGER.info("weak_class_loss_weight=%s", args.weak_class_loss_weight)
+    LOGGER.info("disabled_train_classes=%s", args.disabled_train_classes)
+    LOGGER.info("class_keep_ratio=%s", args.class_keep_ratio)
+    LOGGER.info("class_loss_scale=%s", args.class_loss_scale)
     LOGGER.info("old_class_sample_ratio=%s", args.old_class_sample_ratio)
     LOGGER.info("rare_class_keep_ratio=%s", args.rare_class_keep_ratio)
     LOGGER.info("rare_balance_enabled=%s", args.rare_balance_enabled)
     LOGGER.info("rare_oversample=%s", args.rare_oversample)
-    LOGGER.info("reference_old5=%s", args.reference_old5)
-    LOGGER.info("class loss weights=%s", args.class_weights)
-    if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset", "stage1_rare_rescue", "unfreeze_recalibrate", "text_realign_1ep"} and args.resume is None and args.resume_best is None:
+    LOGGER.info("class_weights=%s", args.class_weights)
+    if args.preset in {"split_bridge_stage1", "split_bridge_stage2_fullset", "stage1_rare_rescue", "unfreeze_recalibrate", "text_realign_1ep", "gamble_no_window_from6", "gamble_weak_window_from6"} and args.resume is None and args.resume_best is None:
         LOGGER.warning("preset=%s 建议显式传入 --resume_best 或 --resume 作为热启动起点。", args.preset)
     if args.unfreeze_image_mode != "none" and not args.no_auto_resume:
         LOGGER.warning("partial unfreeze 建议使用 --resume_best 和 --no_auto_resume，避免加载旧 optimizer 状态。")
@@ -1317,50 +1090,50 @@ def main():
             LOGGER.warning("当前是 fullset 直接提交模式。建议先用默认 train/val 对照训练确认收益，再决定是否用 fullset 收尾。")
     else:
         LOGGER.info("当前默认主线是 train/val 对照模式，会保存 best_all11.pt / best_old5.pt / best_rare.pt。")
+    if args.weak3_enabled:
+        LOGGER.info("========== WEAK3 TRAINING ENABLED ==========")
+        LOGGER.info(
+            "window keep_ratio=%.2f loss_weight=%.2f oversample=%s",
+            float(args.weak_class_keep_ratio.get("window", 1.0)),
+            float(args.weak_class_loss_weight.get("window", 1.0)),
+            int(args.rare_oversample.get("window", 0)),
+        )
+        LOGGER.info(
+            "door keep_ratio=%.2f loss_weight=%.2f oversample=%s",
+            float(args.weak_class_keep_ratio.get("door", 1.0)),
+            float(args.weak_class_loss_weight.get("door", 1.0)),
+            int(args.rare_oversample.get("door", 0)),
+        )
+        LOGGER.info(
+            "pole_light keep_ratio=%.2f loss_weight=%.2f oversample=%s",
+            float(args.weak_class_keep_ratio.get("pole_light", 1.0)),
+            float(args.weak_class_loss_weight.get("pole_light", 1.0)),
+            int(args.rare_oversample.get("pole_light", 0)),
+        )
+        LOGGER.info("11-class inference format kept unchanged")
+        LOGGER.info("===========================================")
 
     LOGGER.info("开始初始化模型...")
-    model = build_model_from_config(args).to(device)
-    trainable_info = None
+    model = ESAMCCLIPModel(
+        tokenizer_dir=args.tokenizer_dir,
+        efficient_sam_ckpt=args.efficient_sam_ckpt,
+        freeze_image=args.freeze_image_encoder,
+        freeze_text=args.freeze_text_encoder,
+    ).to(device)
     if args.train_decoder_only:
-        trainable_info = set_trainable_modules(
-            model,
-            {
-                "train_decoder": True,
-                "train_refine_head": args.train_refine_head,
-                "unfreeze_image_mode": args.unfreeze_image_mode,
-            },
-        )
+        partial_warnings, partial_matches = set_partial_image_encoder_trainable(model, args.unfreeze_image_mode)
         if args.unfreeze_image_mode != "none":
-            LOGGER.info(
-                "partial image encoder trainable params matched=%d",
-                len(trainable_info.get("matched_image_param_names", [])),
-            )
-            if trainable_info.get("warnings"):
-                LOGGER.info("partial image encoder warnings=%s", trainable_info["warnings"])
-    else:
-        trainable_info = set_trainable_modules(
-            model,
-            {
-                "train_decoder": True,
-                "train_refine_head": args.train_refine_head,
-                "unfreeze_image_mode": args.unfreeze_image_mode,
-            },
-        )
+            LOGGER.info("partial image encoder trainable params matched=%d", len(partial_matches))
+            if partial_warnings:
+                LOGGER.info("partial image encoder warnings=%s", partial_warnings)
 
     total_params, trainable_params = count_parameters(model)
     LOGGER.info("total parameter count=%.2fM", total_params)
     LOGGER.info("trainable parameter count=%.2fM", trainable_params)
     if args.print_trainable_params:
         log_trainable_parameter_summary(model, args)
-    args.trainable_modules, args.trainable_parameter_count = infer_trainable_modules(args, trainable_info, model)
-    LOGGER.info("trainable modules=%s", args.trainable_modules)
-    LOGGER.info("trainable parameter count=%d", args.trainable_parameter_count)
-    LOGGER.info(
-        "sampling ratios: old_class_sample_ratio=%s rare_class_keep_ratio=%s negative_sample_ratio=%s",
-        args.old_class_sample_ratio,
-        args.rare_class_keep_ratio,
-        args.negative_sample_ratio,
-    )
+
+    resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
     if resume_checkpoint_path is not None:
         LOGGER.info("检测到断点续训 checkpoint: %s", resume_checkpoint_path)
     elif args.resume_best is not None:
@@ -1374,7 +1147,6 @@ def main():
         load_info = getattr(model, "_last_checkpoint_load_info", {})
         LOGGER.info("checkpoint loaded path=%s", load_info.get("checkpoint_path", args.resume_best))
         LOGGER.info("decoder_matched_keys=%d", len(load_info.get("decoder_matched_keys", [])))
-        LOGGER.info("refine_head_matched_keys=%d", len(load_info.get("refine_head_matched_keys", [])))
         LOGGER.info("missing_keys=%s", missing_keys[:30])
         LOGGER.info("unexpected_keys=%s", unexpected_keys[:30])
         if checkpoint and not args.resume_weights_only:
@@ -1432,7 +1204,7 @@ def main():
             collate_fn=collate_fn,
         )
 
-    optimizer = build_optimizer(model, args.decoder_lr, args.image_lr, args.text_lr, args.refine_lr, args.weight_decay)
+    optimizer = build_optimizer(model, args.decoder_lr, args.image_lr, args.text_lr, args.weight_decay)
     total_steps = args.epochs * max(len(train_loader), 1)
     warmup_steps = args.warmup_epochs * max(len(train_loader), 1)
     scheduler = build_scheduler(optimizer, total_steps, warmup_steps, args.min_lr_ratio) if total_steps > 0 else None
@@ -1440,9 +1212,9 @@ def main():
     criterion_dice = DiceLoss()
     criterion_focal = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
 
-    save_json(run_dir / "config_used.json", _json_safe(vars(args)))
+    save_json(run_dir / "config_used.json", {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
     history = defaultdict(list)
-    best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_score": -1.0}
+    best_metrics = {"best_all11": -1.0, "best_old5": -1.0, "best_rare": -1.0, "best_pos_only": -1.0, "best_rescue": -1.0}
     start_epoch = 1
     if resume_checkpoint_path is not None:
         start_epoch, history, best_metrics, _ = resume_training_state(
@@ -1461,22 +1233,8 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         last_epoch = epoch
-        val_metrics = {}
         LOGGER.info("%s Epoch %d/%d", "─" * 50, epoch, args.epochs)
-        train_stats = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            criterion_dice,
-            criterion_focal,
-            scaler,
-            device,
-            text_cache_payload,
-            args,
-            epoch=epoch,
-            total_epochs=args.epochs,
-        )
+        train_stats = train_one_epoch(model, train_loader, optimizer, scheduler, criterion_dice, criterion_focal, scaler, device, text_cache_payload, args)
         current_lr = optimizer.param_groups[0]["lr"]
         history["train_loss"].append(train_stats["loss"])
         history["train_bce"].append(train_stats["bce"])
@@ -1509,53 +1267,35 @@ def main():
             for class_name in CLASSES:
                 history[f"iou/{class_name}"].append(val_metrics.get(f"iou/{class_name}", 0.0))
 
-            current_all11 = val_metrics.get("iou/overall", 0.0)
-            current_old5 = val_metrics.get("iou/old5", 0.0)
-            current_rare = val_metrics.get("iou/rare", 0.0)
-            current_pos_only = val_metrics.get("iou/pos_only", 0.0)
-            score_reference_old5, reference_old5_source = resolve_score_reference_old5(args, best_metrics)
-            args.reference_old5_source = reference_old5_source
-            selection_score, old_drop_penalty = compute_selection_score(
-                current_all11=current_all11,
-                current_old5=current_old5,
-                current_rare=current_rare,
-                reference_old5=score_reference_old5,
-            )
-            history["selection_score"].append(selection_score)
-            history["old_drop_penalty"].append(old_drop_penalty)
-            history["reference_old5"].append(score_reference_old5 if score_reference_old5 is not None else "")
-
             LOGGER.info(
-                "TrainLoss=%.4f BCE=%.4f Dice=%.4f Focal=%.4f all11_mIoU=%.4f old5_mIoU=%.4f rare_mIoU=%.4f "
-                "pos_mIoU=%.4f Dice=%.4f selection_score=%.4f old_drop_penalty=%.4f "
-                "LR=%.2e epoch_time=%.1fs batch_time=%.2fs image_cache_hit_rate=%.2f%%",
+                "TrainLoss=%.4f BCE=%.4f Dice=%.4f Focal=%.4f mIoU_all11=%.4f mIoU_old5=%.4f mIoU_rare=%.4f "
+                "pos_mIoU=%.4f Dice=%.4f LR=%.2e epoch_time=%.1fs batch_time=%.2fs image_cache_hit_rate=%.2f%%",
                 train_stats["loss"],
                 train_stats["bce"],
                 train_stats["dice"],
                 train_stats["focal"],
-                current_all11,
-                current_old5,
-                current_rare,
-                current_pos_only,
+                val_metrics.get("iou/overall", 0.0),
+                val_metrics.get("iou/old5", 0.0),
+                val_metrics.get("iou/rare", 0.0),
+                val_metrics.get("iou/pos_only", 0.0),
                 val_metrics.get("dice/overall", 0.0),
-                selection_score,
-                old_drop_penalty,
                 current_lr,
                 train_stats["epoch_time"],
                 train_stats["batch_time"],
                 100.0 * train_stats["image_cache_hit_rate"],
             )
-            LOGGER.info(
-                "reference_old5_source=%s reference_old5=%s",
-                reference_old5_source,
-                "none" if score_reference_old5 is None else f"{score_reference_old5:.4f}",
-            )
             LOGGER.info("Per-class IoU: %s", "  ".join(f"{name}={val_metrics.get(f'iou/{name}', 0.0):.3f}" for name in CLASSES))
         if torch.cuda.is_available() and device.type == "cuda":
             LOGGER.info("GPU memory max allocated: %.2f GB", torch.cuda.max_memory_allocated() / (1024 ** 3))
-        if args.no_val:
-            save_checkpoint(run_dir / "best.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
+
+        save_checkpoint(run_dir / "last.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
         if not args.no_val:
+            current_all11 = val_metrics.get("iou/overall", 0.0)
+            current_old5 = val_metrics.get("iou/old5", 0.0)
+            current_rare = val_metrics.get("iou/rare", 0.0)
+            current_pos_only = val_metrics.get("iou/pos_only", 0.0)
+            rescue_score = current_all11 + 0.30 * current_rare - 0.50 * max(0.0, 0.655 - current_old5)
+            history["rescue_score"].append(rescue_score)
             if current_all11 > best_metrics["best_all11"]:
                 best_metrics["best_all11"] = current_all11
                 save_checkpoint(run_dir / "best_all11.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
@@ -1568,28 +1308,16 @@ def main():
             if current_pos_only > best_metrics["best_pos_only"]:
                 best_metrics["best_pos_only"] = current_pos_only
                 save_checkpoint(run_dir / "best_pos_only.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
-            if selection_score > best_metrics["best_score"]:
-                best_metrics["best_score"] = selection_score
-                save_checkpoint(run_dir / "best_score.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
-                save_checkpoint(run_dir / "best.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
+            if rescue_score > best_metrics["best_rescue"]:
+                best_metrics["best_rescue"] = rescue_score
+                save_checkpoint(run_dir / "best_rescue.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
                 LOGGER.info(
-                    "★ best_score 更新 selection_score=%.4f all11=%.4f old5=%.4f rare=%.4f old_drop_penalty=%.4f",
-                    selection_score,
+                    "★ best_rescue 更新 rescue_score=%.4f all11=%.4f old5=%.4f rare=%.4f",
+                    rescue_score,
                     current_all11,
                     current_old5,
                     current_rare,
-                    old_drop_penalty,
                 )
-        save_checkpoint(run_dir / "last.pt", epoch, model, optimizer, scheduler, history, best_metrics, args)
-        save_metrics_snapshot(
-            run_dir=run_dir,
-            epoch=epoch,
-            history=history,
-            best_metrics=best_metrics,
-            train_stats=train_stats,
-            val_metrics=val_metrics if not args.no_val else {},
-            args=args,
-        )
 
     if last_epoch > 0:
         final_name = "final_fullset.pt" if args.no_val else "final_split.pt"
@@ -1672,8 +1400,6 @@ def main():
             "val_miou_all11",
             "val_miou_old5",
             "val_miou_rare",
-            "selection_score",
-            "old_drop_penalty",
             "val_pos_miou",
             "val_dice",
             "lr",

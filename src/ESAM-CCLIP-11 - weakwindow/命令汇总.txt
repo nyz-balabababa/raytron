@@ -1,0 +1,465 @@
+ESAM-CCLIP-11 命令汇总
+
+说明
+- 以下命令默认在项目根目录 `D:\nyz\raytron_project` 下执行。
+- 以下均为 PowerShell 多行写法，续行符使用反引号 `` ` ``。
+- 训练命令默认使用 `python src/ESAM-CCLIP-11/train_esam_cclip_11.py`。
+- Sweep 命令默认使用 `python src/ESAM-CCLIP-11/sweep_thresholds_11.py`。
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset text_realign_1ep `
+  --resume_best "D:\nyz\raytron_project\test\train_output\ESAM-CCLIP-11-old-balanced\final_fullset.pt" `
+  --run_name "ESAM-CCLIP-11-old-balanced-text-realign-fullset-1ep" `
+  --train_json "test/clean_rare/label/trainval_label.json" `
+  --no_val `
+  --no_train_split_filter `
+  --epochs 1 `
+  --decoder_lr 5e-6 `
+  --rebuild_text_cache `
+  --text_cache_path "test/cache/text_emb_11_old_fullset_text_realign.pt" `
+  --no_auto_resume
+
+--训练
+python .\train_esam_cclip_11.py `
+  --preset warm3_old_anchor_lite_v2 `
+  --resume_best "E:\nyz_project\rayton\test\train_output\ESAM-CCLIP-11-fastfinetune\final_fullset.pt" `
+  --run_name "ESAM-CCLIP-11-warm3-old-anchor-lite-v2" `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --rebuild_text_cache
+  --epochs 1 `
+
+
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint "E:\nyz_project\rayton\test\train_output\ESAM-CCLIP-11-old-balanced-text-realign-fullset-1ep\final_fullset.pt" `
+  --sweep_mode recall `
+  --prompt_fusion_mode prototype `
+  --raw_prompt_weight 0.0 `
+  --prompt_match_mode exact `
+  --max_samples_per_class 1000 `
+  --text_cache_path "E:\nyz_project\raytont\test\cache\text_emb_lite_text.pt" `
+  --rebuild_text_cache `
+  --out_checkpoint "E:\nyz_project\rayton\model\submit-lite_text\sam3.pt"
+
+一、训练命令
+
+1. 路线一：lite_fullset_polish
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset lite_fullset_polish `
+  --resume_best test/train_output/ESAM-CCLIP-11-old-balanced/final_fullset.pt `
+  --no_val `
+  --no_train_split_filter `
+  --no_auto_resume `
+  --epochs 3 `
+  --decoder_lr 5e-5 `
+  --rebuild_text_cache `
+  --text_cache_path test/cache/text_emb_11_lite_polish.pt
+
+
+2. 路线二 Stage1：split_bridge_stage1
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset split_bridge_stage1 `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-control/best_all11.pt `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 3 `
+  --decoder_lr 5e-5 `
+  --rebuild_text_cache `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt
+
+
+3. 路线二 Stage2：split_bridge_stage2_fullset
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset split_bridge_stage2_fullset `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-bridge-stage1/best_all11.pt `
+  --no_val `
+  --no_train_split_filter `
+  --no_auto_resume `
+  --epochs 3 `
+  --decoder_lr 3e-5 `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt
+
+
+4. Stage1 上的激进 rare rescue
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset stage1_rare_rescue `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-bridge-stage1/best_all11.pt `
+  --run_name ESAM-CCLIP-11-stage1-rare-rescue `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --decoder_lr 2e-5 `
+  --negative_sample_ratio 0.02 `
+  --negative_sample_weight 0.15 `
+  --old_class_sample_ratio 0.85 `
+  --rare_class_keep_ratio 1.0
+
+
+5. Stage1 上的 mild rare rescue
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset stage1_rare_rescue `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-bridge-stage1/best_all11.pt `
+  --run_name ESAM-CCLIP-11-stage1-mild-rare-rescue `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --decoder_lr 2e-5 `
+  --negative_sample_ratio 0.005 `
+  --negative_sample_weight 0.05 `
+  --old_class_sample_ratio 0.95 `
+  --rare_class_keep_ratio 1.0
+
+
+6. Stage2 上的 mild rare rescue
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset rare_repair_lite `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-bridge-satge2/final_fullset.pt `
+  --run_name ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --decoder_lr 1e-5 `
+  --negative_sample_ratio 0.005 `
+  --negative_sample_weight 0.05 `
+  --old_class_sample_ratio 0.95 `
+  --rare_class_keep_ratio 1.0
+
+
+7. 路线三：partial_unfreeze_lastnorm
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset partial_unfreeze_lastnorm `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-bridge-stage1/best_all11.pt `
+  --run_name ESAM-unfreeze-stage1-lastnorm-1ep `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --batch_size 8 `
+  --decoder_lr 2e-5 `
+  --image_lr 1e-6
+
+
+8. 路线三：partial_unfreeze_last1
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset partial_unfreeze_last1 `
+  --resume_best test/train_output/ESAM-CCLIP-11-split-bridge-stage1/best_all11.pt `
+  --run_name ESAM-CCLIP-11-unfreeze-stage1-last1-1ep `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --batch_size 8 `
+  --decoder_lr 1e-5 `
+  --image_lr 1e-7 `
+  --warmup_epochs 0 `
+  --min_lr_ratio 0.5
+
+
+9. 路线三-A：unfreeze 后 decoder-only recalibrate
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset unfreeze_recalibrate `
+  --resume_best test/train_output/ESAM-unfreeze-stage1-lastnorm-1ep/best_all11.pt `
+  --run_name ESAM-CCLIP-11-unfreeze-recalibrate-1ep `
+  --no_auto_resume `
+  --decoder_lr 5e-6
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset unfreeze_recalibrate `
+  --resume_best "test/train_output/ESAM-unfreeze-stage1-lastnorm-1ep/best_all11.pt" `
+  --run_name "ESAM-CCLIP-11-stage1-unfreeze-recalibrate-1ep-bs8" `
+  --batch_size 8 `
+  --train_eval_batch_size 8 `
+  --no_auto_resume
+
+
+10. 路线三-B 第一步：stage2_mild 上做极轻 lastnorm 解冻
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset partial_unfreeze_lastnorm `
+  --resume_best test/train_output/ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt `
+  --run_name ESAM-CCLIP-11-stage2-mild-unfreeze-lastnorm-1ep `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --batch_size 8 `
+  --decoder_lr 5e-6 `
+  --image_lr 1e-7 `
+  --negative_sample_ratio 0.005 `
+  --negative_sample_weight 0.05 `
+  --old_class_sample_ratio 1.0 `
+  --rare_class_keep_ratio 1.0
+
+
+11. 路线三-B 第二步：stage2_mild 解冻后 recalibrate
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset split_bridge_stage1 `
+  --resume_best test/train_output/ESAM-CCLIP-11-stage2-mild-unfreeze-lastnorm-1ep/best_all11.pt `
+  --run_name ESAM-CCLIP-11-stage2-mild-unfreeze-recalibrate-1ep `
+  --with_val `
+  --use_train_split_filter `
+  --no_auto_resume `
+  --epochs 1 `
+  --decoder_lr 5e-6 `
+  --negative_sample_ratio 0.005 `
+  --negative_sample_weight 0.05 `
+  --old_class_sample_ratio 1.0 `
+  --rare_class_keep_ratio 1.0 `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt
+
+
+二、Sweep 命令
+
+1. lite 主线：hybrid
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-old-balanced/final_fullset.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_old_balanced.pt `
+  --sweep_mode hybrid `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_esam_11_hybrid_lite `
+  --write_back_checkpoint `
+  --write_back_path model/submit-rsam-lite-hybrid/sam3.pt
+
+
+2. lite 主线：旧 recall 版本
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-old-balanced/final_fullset.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_old_balanced.pt `
+  --sweep_mode recall `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_lite_recall `
+  --write_back_checkpoint `
+  --write_back_path model/submit-rsam-lite-recall/sam3.pt
+
+
+3. split-control：safe / best 风格
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-split-control/best_all11.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt `
+  --sweep_mode best `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_esam_11_mid_safe `
+  --write_back_checkpoint `
+  --write_back_path model/submit-rsam-mid-safe/sam3.pt
+
+
+4. 路线二 Stage2：hybrid
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-split-bridge-satge2/final_fullset.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt `
+  --sweep_mode hybrid `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_esam_11_hybrid_stage2 `
+  --write_back_checkpoint `
+  --write_back_path model/submit-rsam-hybrid-stage2/sam3.pt
+
+
+5. 路线三 unfreeze：hybrid
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-unfreeze-stage1-lastnorm-1ep/best_all11.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_split_bridge.pt `
+  --sweep_mode hybrid `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_stage1_unfreeze_hybrid `
+  --write_back_checkpoint `
+  --write_back_path model/submit-stage1-unfreeze-hybrid/sam3.pt
+
+
+6. Stage2 mild rare rescue：fine_recall
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_rare_repair_lite.pt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_stage2_mild_rare_rescue_fine_recall_1000 `
+  --write_back_checkpoint `
+  --write_back_path model/submit-stage2-mild-rare-rescue-fine-recall/sam3.pt
+
+
+7. Stage2 mild rare rescue：hybrid
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_rare_repair_lite.pt `
+  --sweep_mode hybrid `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_stage2_mild_rare_rescue_hybrid_1000 `
+  --write_back_checkpoint `
+  --write_back_path model/submit-stage2-mild-rare-rescue-hybrid/sam3.pt
+
+
+8. Stage2 mild rare rescue：best_rescue 版本 fine_recall
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_rescue.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_rare_repair_lite.pt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_stage2_mild_rare_rescue_bestrescue_fine_recall_1000 `
+  --write_back_checkpoint `
+  --write_back_path model/submit-stage2-mild-rare-rescue-bestrescue-fine-recall/sam3.pt
+
+
+9. Stage2 mild rare rescue：best_rescue 版本 hybrid
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint test/train_output/ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_rescue.pt `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path test/cache/text_emb_11_rare_repair_lite.pt `
+  --sweep_mode hybrid `
+  --max_samples_per_class 1000 `
+  --output_dir test/train_output/threshold_sweep_stage2_mild_rare_rescue_bestrescue_hybrid_1000 `
+  --write_back_checkpoint `
+  --write_back_path model/submit-stage2-mild-rare-rescue-bestrescue-hybrid/sam3.pt
+
+
+10. 通用：全量验证集 sweep
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py `
+  --checkpoint <你的权重.pt> `
+  --val_json test/clean_rare/label/val_label.json `
+  --val_list test/val_list.txt `
+  --image_root test `
+  --tokenizer_dir src/hanxue/weights/chinese_clip `
+  --text_cache_path <对应 text cache>.pt `
+  --sweep_mode fine_recall `
+  --max_samples_per_class 0 `
+  --output_dir <你的输出目录> `
+  --write_back_checkpoint `
+  --write_back_path <你的 sam3.pt 输出路径>
+
+
+三、对比和工具
+
+1. 查看 train 参数帮助
+
+python src/ESAM-CCLIP-11/train_esam_cclip_11.py --help
+
+
+2. 查看 sweep 参数帮助
+
+python src/ESAM-CCLIP-11/sweep_thresholds_11.py --help
+
+
+3. checkpoint averaging
+
+python src/ESAM-CCLIP-11/tools/average_checkpoints.py `
+  --checkpoints <ckpt1.pt> <ckpt2.pt> <ckpt3.pt> `
+  --output <averaged.pt>
+
+
+4. checkpoint averaging 查看帮助
+
+python src/ESAM-CCLIP-11/tools/average_checkpoints.py --help
+
+
+四、text cache 常用对应
+
+- split 主线：
+  `test/cache/text_emb_11_split_bridge.pt`
+
+- stage1 rare rescue：
+  `test/cache/text_emb_11_stage1_rare_rescue.pt`
+
+- stage2 mild rare rescue：
+  `test/cache/text_emb_11_rare_repair_lite.pt`
+
+- lite / old-balanced：
+  `test/cache/text_emb_11_old_balanced.pt`
+  或
+  `test/cache/text_emb_11_lite_polish.pt`
+
+
+五、常看输出文件
+
+- 训练日志：
+  `test/train_output/<run_name>/<run_name>.log`
+
+- 训练权重：
+  `best_all11.pt`
+  `best_old5.pt`
+  `best_rare.pt`
+  `best_pos_only.pt`
+  `best_rescue.pt`
+  `final_fullset.pt`
+  `final_split.pt`
+  `last.pt`
+
+- sweep 输出：
+  `best_thresholds.json`
+  `best_postprocess.json`
+  `sweep_summary.json`
+  `sweep_summary_terminal.txt`
+  `threshold_sweep_summary.csv`
+  `sweep_run.log`
+
+D:\anconda3\envs\rayton\python.exe src/ESAM-CCLIP-11/train_esam_cclip_11.py `
+  --preset text_realign_1ep `
+  --resume_best "test/train_output/ESAM-CCLIP-11-stage2-mild-rare-rescue-1ep/best_all11.pt" `
+  --run_name "ESAM-CCLIP-11-text-realign-1ep-bs8" `
+  --with_val `
+  --use_train_split_filter `
+  --epochs 1 `
+  --batch_size 8 `
+  --decoder_lr 5e-6 `
+  --negative_sample_ratio 0.005 `
+  --negative_sample_weight 0.05 `
+  --text_cache_path "test/cache/text_emb_11_text_realign_alias.pt" `
+  --no_auto_resume

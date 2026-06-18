@@ -7,6 +7,7 @@ src/zmq-DINO
 src/DINO/models
 src/DINO/groundingdino
 src/DINO/efficient_sam
+Nayra_final/
 # ── 提交打包目录（不进 git）──
 to_Df*/
 

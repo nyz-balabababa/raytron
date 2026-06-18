@@ -1,0 +1,21 @@
+{
+  "pipeline": "unfreeze_then_refine",
+  "pipeline_root": "D:\\nyz\\raytron_project\\runs\\URF_A_manual",
+  "executed_stages": [
+    "A2_recalibrate"
+  ],
+  "skipped_stages": [
+    "A1_unfreeze",
+    "A3_refine"
+  ],
+  "base_ckpt": "D:\\nyz\\raytron_project\\test\\train_output\\efficientsam_easy_6cls_v1\\efficientsam_easy_6cls_v1\\best.pt",
+  "current_resume": "D:\\nyz\\raytron_project\\runs\\URF_A_manual\\A2_recalibrate\\A2_recalibrate\\best.pt",
+  "stage_output_dirs": {
+    "A1_unfreeze": "D:\\nyz\\raytron_project\\runs\\URF_A_manual\\A1_unfreeze",
+    "A2_recalibrate": "D:\\nyz\\raytron_project\\runs\\URF_A_manual\\A2_recalibrate",
+    "A3_refine": "D:\\nyz\\raytron_project\\runs\\URF_A_manual\\A3_refine"
+  },
+  "start_stage": "A2_recalibrate",
+  "stop_after_stage": "A2_recalibrate",
+  "reference_old5": -1.0
+}

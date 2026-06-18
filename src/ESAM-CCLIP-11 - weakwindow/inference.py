@@ -1095,69 +1095,12 @@ class FiLMFusionDecoder(torch.nn.Module):
         return F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
 
 
-class ZeroInitResidualRefineHead(torch.nn.Module):
-    def __init__(self, hidden_dim: int = 16):
-        super().__init__()
-        hidden_dim = max(int(hidden_dim), 4)
-        self.conv1 = torch.nn.Conv2d(3, hidden_dim, kernel_size=3, padding=1, bias=True)
-        self.act1 = torch.nn.GELU()
-        self.conv2 = torch.nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=True)
-        self.act2 = torch.nn.GELU()
-        self.out = torch.nn.Conv2d(hidden_dim, 1, kernel_size=1, padding=0, bias=True)
-        torch.nn.init.kaiming_normal_(self.conv1.weight, nonlinearity="relu")
-        torch.nn.init.zeros_(self.conv1.bias)
-        torch.nn.init.kaiming_normal_(self.conv2.weight, nonlinearity="relu")
-        torch.nn.init.zeros_(self.conv2.bias)
-        torch.nn.init.zeros_(self.out.weight)
-        torch.nn.init.zeros_(self.out.bias)
-
-    def forward(self, coarse_logits: torch.Tensor, images: torch.Tensor) -> torch.Tensor:
-        if images.shape[-2:] != coarse_logits.shape[-2:]:
-            images = F.interpolate(images, size=coarse_logits.shape[-2:], mode="bilinear", align_corners=False)
-        gray = images.mean(dim=1, keepdim=True)
-        gray_min = gray.amin(dim=(-2, -1), keepdim=True)
-        gray_max = gray.amax(dim=(-2, -1), keepdim=True)
-        gray = (gray - gray_min) / (gray_max - gray_min).clamp_min(1e-6)
-        coarse_prob = torch.sigmoid(coarse_logits)
-        refine_input = torch.cat([gray, coarse_logits, coarse_prob], dim=1)
-        hidden = self.act1(self.conv1(refine_input))
-        hidden = self.act2(self.conv2(hidden))
-        return self.out(hidden)
-
-
-def validate_refine_head_structure(model: torch.nn.Module) -> Dict[str, Any]:
-    refine_head = getattr(model, "refine_head", None)
-    if refine_head is None:
-        raise RuntimeError("model 缺少 refine_head。")
-    if getattr(refine_head.conv1, "in_channels", None) != 3:
-        raise RuntimeError(f"refine_head.conv1.in_channels 必须为 3，当前={refine_head.conv1.in_channels}")
-    if int(torch.count_nonzero(refine_head.out.weight.detach()).item()) != 0:
-        raise RuntimeError("refine_head.out.weight 不是 zero-init。")
-    if int(torch.count_nonzero(refine_head.out.bias.detach()).item()) != 0:
-        raise RuntimeError("refine_head.out.bias 不是 zero-init。")
-    return {
-        "conv1_in_channels": int(refine_head.conv1.in_channels),
-        "out_weight_all_zero": True,
-        "out_bias_all_zero": True,
-    }
-
-
 class ESAMCCLIPModel(torch.nn.Module):
-    def __init__(
-        self,
-        tokenizer_dir: str,
-        freeze_image: bool = True,
-        freeze_text: bool = True,
-        use_refine_head: bool = False,
-        refine_head_hidden_dim: int = 16,
-    ):
+    def __init__(self, tokenizer_dir: str, freeze_image: bool = True, freeze_text: bool = True):
         super().__init__()
         self.img_encoder = SubmissionImageEncoder(freeze=freeze_image)
         self.txt_encoder = SubmissionTextEncoder(model_dir=tokenizer_dir)
         self.decoder = FiLMFusionDecoder(image_dim=256, text_dim=768)
-        self.refine_head = ZeroInitResidualRefineHead(hidden_dim=refine_head_hidden_dim)
-        self.use_refine_head = bool(use_refine_head)
-        self._refine_head_structure_info = validate_refine_head_structure(self)
         if freeze_text:
             for param in self.txt_encoder.parameters():
                 param.requires_grad = False
@@ -1170,29 +1113,8 @@ class ESAMCCLIPModel(torch.nn.Module):
         _, pooled = self.txt_encoder(input_ids, attention_mask)
         return pooled
 
-    def set_refine_head_enabled(self, enabled: bool) -> None:
-        self.use_refine_head = bool(enabled)
-
-    def decode(
-        self,
-        image_features: torch.Tensor,
-        text_features: torch.Tensor,
-        target_size,
-        images: Optional[torch.Tensor] = None,
-        use_refine_head: Optional[bool] = None,
-    ) -> torch.Tensor:
-        coarse_logits = self.decoder(
-            image_features=image_features,
-            text_global_features=text_features,
-            target_size=target_size,
-        )
-        refine_enabled = self.use_refine_head if use_refine_head is None else bool(use_refine_head)
-        if not refine_enabled:
-            return coarse_logits
-        if images is None:
-            raise RuntimeError("use_refine_head=True 但 decode 未收到 images。")
-        residual_logits = self.refine_head(coarse_logits=coarse_logits, images=images)
-        return coarse_logits + residual_logits
+    def decode(self, image_features: torch.Tensor, text_features: torch.Tensor, target_size) -> torch.Tensor:
+        return self.decoder(image_features=image_features, text_global_features=text_features, target_size=target_size)
 
 
 def load_state_dict_flexible(checkpoint: Any) -> Dict[str, torch.Tensor]:
@@ -1244,11 +1166,8 @@ def load_checkpoint_flexible(
     state_dict = load_state_dict_flexible(checkpoint)
     model_state = model.state_dict()
     matched_state: Dict[str, torch.Tensor] = {}
-    matched_keys: List[str] = []
     decoder_matched_keys: List[str] = []
-    refine_head_matched_keys: List[str] = []
     unexpected_keys: List[str] = []
-    shape_mismatch_keys: List[str] = []
 
     for raw_key, value in state_dict.items():
         mapped_key = remap_key(raw_key)
@@ -1256,94 +1175,27 @@ def load_checkpoint_flexible(
             unexpected_keys.append(mapped_key)
             continue
         if model_state[mapped_key].shape != value.shape:
-            shape_mismatch_keys.append(
+            unexpected_keys.append(
                 f"{mapped_key}: ckpt={tuple(value.shape)} model={tuple(model_state[mapped_key].shape)}"
             )
             continue
         matched_state[mapped_key] = value
-        matched_keys.append(mapped_key)
         if mapped_key.startswith("decoder."):
             decoder_matched_keys.append(mapped_key)
-        elif mapped_key.startswith("refine_head."):
-            refine_head_matched_keys.append(mapped_key)
 
     missing_keys = [key for key in model_state.keys() if key not in matched_state]
-    unexpected_keys.extend(shape_mismatch_keys)
-    metadata_use_refine_head = bool(checkpoint.get("use_refine_head", False))
-    checkpoint_has_refine_keys = any(remap_key(str(raw_key)).startswith("refine_head.") for raw_key in state_dict.keys())
-    checkpoint_use_refine_head = bool(metadata_use_refine_head or checkpoint_has_refine_keys)
-    checkpoint_claims_refine = bool(checkpoint_use_refine_head or checkpoint_has_refine_keys)
-    refine_shape_mismatch_keys = [key for key in shape_mismatch_keys if key.startswith("refine_head.")]
-    missing_refine_keys = [key for key in missing_keys if key.startswith("refine_head.")]
-    model_use_refine_head = bool(getattr(model, "use_refine_head", False))
-    if not metadata_use_refine_head and checkpoint_has_refine_keys:
-        LOGGER.warning("checkpoint contains refine_head keys but metadata use_refine_head=False, enabling refine_head automatically")
     if len(decoder_matched_keys) == 0:
         raise RuntimeError("decoder_matched_keys=0，说明 decoder 没有成功加载，不能提交")
-    if checkpoint_claims_refine:
-        if len(refine_head_matched_keys) == 0:
-            raise RuntimeError("checkpoint 声明/包含 refine_head，但推理时 refine_head_matched_keys=0，拒绝提交")
-        if refine_shape_mismatch_keys:
-            raise RuntimeError(
-                "checkpoint refine_head 形状不匹配，拒绝提交: "
-                f"{refine_shape_mismatch_keys[:10]}"
-            )
     model.load_state_dict(matched_state, strict=False)
-    if checkpoint_use_refine_head:
-        if not bool(getattr(model, "use_refine_head", False)):
-            raise RuntimeError("checkpoint_use_refine_head=True，但 model.use_refine_head=False，拒绝提交")
-        if len(refine_head_matched_keys) <= 0:
-            raise RuntimeError("checkpoint_use_refine_head=True，但 refine_head_matched_keys=0，拒绝提交")
-        if refine_shape_mismatch_keys:
-            raise RuntimeError("checkpoint_use_refine_head=True，但 refine_head 存在 shape mismatch，拒绝提交")
-    model._last_checkpoint_load_info = {
-        "checkpoint_path": str(checkpoint_path),
-        "matched_keys": matched_keys,
-        "decoder_matched_keys": decoder_matched_keys,
-        "refine_head_matched_keys": refine_head_matched_keys,
-        "missing_keys": missing_keys,
-        "missing_refine_keys": missing_refine_keys,
-        "unexpected_keys": unexpected_keys,
-        "shape_mismatch_keys": shape_mismatch_keys,
-        "refine_shape_mismatch_keys": refine_shape_mismatch_keys,
-        "checkpoint_use_refine_head": checkpoint_use_refine_head,
-        "metadata_use_refine_head": metadata_use_refine_head,
-        "checkpoint_has_refine_keys": checkpoint_has_refine_keys,
-        "checkpoint_claims_refine": checkpoint_claims_refine,
-        "model_use_refine_head": model_use_refine_head,
-    }
     LOGGER.info("checkpoint loaded: %s", checkpoint_path)
     LOGGER.info(
-        "matched_keys=%d decoder_matched_keys=%d refine_head_matched_keys=%d missing_keys=%d unexpected_keys=%d",
+        "matched_keys=%d decoder_matched_keys=%d missing_keys=%d unexpected_keys=%d",
         len(matched_state),
         len(decoder_matched_keys),
-        len(refine_head_matched_keys),
         len(missing_keys),
         len(unexpected_keys),
     )
-    LOGGER.info(
-        "checkpoint_use_refine_head=%s checkpoint_has_refine_keys=%s checkpoint_claims_refine=%s model_use_refine_head=%s refine_head_matched_count=%d refine_shape_mismatch_count=%d",
-        checkpoint_use_refine_head,
-        checkpoint_has_refine_keys,
-        checkpoint_claims_refine,
-        model_use_refine_head,
-        len(refine_head_matched_keys),
-        len(refine_shape_mismatch_keys),
-    )
-    if not checkpoint_claims_refine and missing_refine_keys and model_use_refine_head:
-        LOGGER.info("old checkpoint has no refine_head, keep zero-init refine_head")
-    if missing_refine_keys:
-        LOGGER.info("missing_refine_keys_preview=%s", missing_refine_keys[:20])
-    if refine_shape_mismatch_keys:
-        LOGGER.info("refine_shape_mismatch_keys_preview=%s", refine_shape_mismatch_keys[:20])
     return checkpoint, missing_keys, unexpected_keys
-
-
-def resolve_checkpoint_use_refine_head(checkpoint: Dict[str, Any]) -> bool:
-    if bool(checkpoint.get("use_refine_head", False)):
-        return True
-    state_dict = load_state_dict_flexible(checkpoint)
-    return any(remap_key(str(raw_key)).startswith("refine_head.") for raw_key in state_dict.keys())
 
 
 def normalize_decoder_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1866,60 +1718,41 @@ def resolve_checkpoint_prompt_prototypes(
     checkpoint: Dict[str, Any],
     classes: List[str],
 ) -> Dict[str, List[str]]:
-    merged_prototypes = normalize_prompt_prototypes(DEFAULT_PROMPT_PROTOTYPES, classes)
     if isinstance(checkpoint, dict):
         ckpt_prototypes = checkpoint.get("prompt_prototypes")
         if isinstance(ckpt_prototypes, dict):
-            for class_name, aliases in ckpt_prototypes.items():
-                if str(class_name) not in merged_prototypes:
-                    continue
-                merged_prototypes[str(class_name)] = [str(alias) for alias in aliases]
-            return normalize_prompt_prototypes(merged_prototypes, classes)
-    return merged_prototypes
+            missing = [class_name for class_name in classes if class_name not in ckpt_prototypes]
+            if missing:
+                raise RuntimeError(f"checkpoint prompt_prototypes 缺少类别: {missing}")
+            normalized = normalize_prompt_prototypes(ckpt_prototypes, classes)
+            return normalized
+    return normalize_prompt_prototypes(DEFAULT_PROMPT_PROTOTYPES, classes)
 
 
 def resolve_checkpoint_thresholds(checkpoint: Dict[str, Any]) -> Dict[str, float]:
     raw_thresholds = (
         checkpoint.get("val_thresholds")
         or checkpoint.get("prompt_thresholds")
-        or checkpoint.get("thresholds")
-        or checkpoint.get("class_mask_thresholds")
-        or {}
+        or DEFAULT_THRESHOLDS
     )
-    thresholds = {str(key): float(value) for key, value in DEFAULT_THRESHOLDS.items()}
-    thresholds.update({str(key): float(value) for key, value in raw_thresholds.items()})
-    return thresholds
+    return {str(key): float(value) for key, value in raw_thresholds.items()}
 
 
 def resolve_checkpoint_postprocess(checkpoint: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     raw_postprocess = (
         checkpoint.get("postprocess_cfg")
         or checkpoint.get("postprocess")
-        or {}
+        or DEFAULT_POSTPROCESS
     )
-    normalized: Dict[str, Dict[str, Any]] = {
-        str(key): {
-            "min_area": int(cfg.get("min_area", 0)),
-            "fill_holes": bool(cfg.get("fill_holes", False)),
-            **({"topk_components": int(cfg.get("topk_components", 0))} if cfg.get("topk_components") is not None else {}),
-        }
-        for key, cfg in DEFAULT_POSTPROCESS.items()
-    }
-    flat_min_area = checkpoint.get("min_area") if isinstance(checkpoint, dict) else None
-    if isinstance(flat_min_area, dict):
-        for key, value in flat_min_area.items():
-            class_name = str(key)
-            normalized.setdefault(class_name, {"min_area": 0, "fill_holes": False})
-            normalized[class_name]["min_area"] = int(value)
+    normalized: Dict[str, Dict[str, Any]] = {}
     for key, cfg in raw_postprocess.items():
-        class_name = str(key)
         normalized_cfg = {
             "min_area": int(cfg.get("min_area", 0)),
             "fill_holes": bool(cfg.get("fill_holes", False)),
         }
         if "topk_components" in cfg and cfg.get("topk_components") is not None:
             normalized_cfg["topk_components"] = int(cfg.get("topk_components", 0))
-        normalized[class_name] = normalized_cfg
+        normalized[str(key)] = normalized_cfg
     return normalized
 
 
@@ -1941,12 +1774,6 @@ def load_model(
     checkpoint_preview = load_checkpoint_payload(checkpoint_path, device)
     classes = resolve_checkpoint_classes(checkpoint_preview)
     prompt_prototypes = resolve_checkpoint_prompt_prototypes(checkpoint_preview, classes)
-    checkpoint_has_refine_keys = any(
-        remap_key(str(raw_key)).startswith("refine_head.")
-        for raw_key in load_state_dict_flexible(checkpoint_preview).keys()
-    )
-    checkpoint_use_refine_head = resolve_checkpoint_use_refine_head(checkpoint_preview)
-    checkpoint_claims_refine = bool(checkpoint_use_refine_head or checkpoint_has_refine_keys)
     prompt_prototypes_source = (
         str(checkpoint_preview.get("prompt_prototypes_source", "default"))
         if isinstance(checkpoint_preview, dict)
@@ -1959,24 +1786,12 @@ def load_model(
         tokenizer_dir=tokenizer_path,
         freeze_image=True,
         freeze_text=True,
-        use_refine_head=checkpoint_use_refine_head,
-        refine_head_hidden_dim=int(checkpoint_preview.get("refine_head_hidden_dim", 16)) if isinstance(checkpoint_preview, dict) else 16,
     ).to(device)
 
     checkpoint, missing_keys, unexpected_keys = load_checkpoint_flexible(
         model,
         checkpoint_preview,
         checkpoint_path,
-    )
-    model.set_refine_head_enabled(checkpoint_use_refine_head)
-    load_info = getattr(model, "_last_checkpoint_load_info", {})
-    LOGGER.info(
-        "checkpoint_use_refine_head=%s checkpoint_has_refine_keys=%s checkpoint_claims_refine=%s model_use_refine_head=%s refine_head_matched_keys_count=%d",
-        checkpoint_use_refine_head,
-        checkpoint_has_refine_keys,
-        checkpoint_claims_refine,
-        bool(getattr(model, "use_refine_head", False)),
-        len(load_info.get("refine_head_matched_keys", [])),
     )
     if missing_keys:
         LOGGER.warning("checkpoint missing_keys=%d，前10项: %s", len(missing_keys), missing_keys[:10])
@@ -2067,23 +1882,12 @@ def do_inference(
                     continue
                 route_features = torch.stack([feature_list[idx] for idx in indices], dim=0).to(device, non_blocking=True)
                 route_image_batch = image_embedding.expand(route_features.size(0), -1, -1, -1).contiguous()
-                route_input_images = (
-                    image_tensor.unsqueeze(0)
-                    .to(device, non_blocking=True)
-                    .expand(route_features.size(0), -1, -1, -1)
-                    .contiguous()
-                )
                 decoder = router_info["decoder_lite"] if route_name == "lite" else router_info["decoder_stage2"]
                 route_logits = decoder(
                     image_features=route_image_batch,
                     text_global_features=route_features,
                     target_size=(model_input_size, model_input_size),
                 )
-                if getattr(model, "use_refine_head", False):
-                    route_logits = route_logits + model.refine_head(
-                        coarse_logits=route_logits,
-                        images=route_input_images,
-                    )
                 if route_logits.ndim != 4 or route_logits.shape[1] != 1:
                     raise RuntimeError(f"{route_name} logits 形状异常，当前: {tuple(route_logits.shape)}")
                 for local_idx, batch_idx in enumerate(indices):
@@ -2095,8 +1899,6 @@ def do_inference(
                 image_features=image_batch,
                 text_features=text_features,
                 target_size=(model_input_size, model_input_size),
-                images=image_tensor.unsqueeze(0).to(device, non_blocking=True).expand(text_features.size(0), -1, -1, -1).contiguous(),
-                use_refine_head=getattr(model, "use_refine_head", False),
             )
             if logits.ndim != 4 or logits.shape[1] != 1:
                 raise RuntimeError(f"logits 形状异常，期望 [B, 1, H, W]，当前: {tuple(logits.shape)}")
@@ -2196,12 +1998,6 @@ def process_tasks(
     elif isinstance(checkpoint, dict) and "prompt_thresholds" in checkpoint:
         LOGGER.info("使用 checkpoint 内 prompt_thresholds")
         threshold_source = "prompt_thresholds"
-    elif isinstance(checkpoint, dict) and "thresholds" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 thresholds")
-        threshold_source = "thresholds"
-    elif isinstance(checkpoint, dict) and "class_mask_thresholds" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 class_mask_thresholds")
-        threshold_source = "class_mask_thresholds"
     else:
         LOGGER.warning("checkpoint 内没有 val_thresholds，使用 DEFAULT_THRESHOLDS")
     postprocess_source = "DEFAULT"
@@ -2215,9 +2011,6 @@ def process_tasks(
     elif isinstance(checkpoint, dict) and "postprocess" in checkpoint:
         LOGGER.info("使用 checkpoint 内 postprocess")
         postprocess_source = "postprocess"
-    elif isinstance(checkpoint, dict) and "min_area" in checkpoint:
-        LOGGER.info("使用 checkpoint 内 min_area + DEFAULT_POSTPROCESS")
-        postprocess_source = "min_area"
     else:
         LOGGER.warning("checkpoint 内没有 postprocess_cfg，使用 DEFAULT_POSTPROCESS")
 
@@ -2228,12 +2021,6 @@ def process_tasks(
     route_map = router_info.get("route_map") if router_info else None
     if router_info and router_info.get("enabled"):
         validate_router_runtime_configs(classes, route_map or {}, thresholds, postprocess_cfg)
-    LOGGER.info(
-        "decoder_runtime: router_enabled=%s use_refine_head=%s router_refine_enabled=%s",
-        bool(router_info and router_info.get("enabled")),
-        bool(getattr(model, "use_refine_head", False)),
-        bool(router_info and router_info.get("enabled") and getattr(model, "use_refine_head", False)),
-    )
     for class_name in classes:
         post_cfg = postprocess_cfg.get(class_name, {})
         LOGGER.info(
@@ -2262,7 +2049,6 @@ def process_tasks(
     model_info["prompt_fusion_mode"] = prompt_fusion_mode
     model_info["raw_prompt_weight"] = float(raw_prompt_weight)
     model_info["prompt_match_mode"] = prompt_match_mode
-    model_info["use_refine_head"] = bool(getattr(model, "use_refine_head", False))
     model_info["threshold_source"] = threshold_source
     model_info["postprocess_source"] = postprocess_source
     model_info["rare_empty_fallback_enabled"] = bool(rare_empty_fallback)
