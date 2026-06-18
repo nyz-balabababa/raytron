@@ -30,8 +30,12 @@ LOGGER = logging.getLogger("ESAM_CCLIP_11")
 
 
 def deterministic_keep(key: str, keep_ratio: float, seed: int) -> bool:
-    s = f"{seed}|{key}".encode("utf-8")
-    value = int(hashlib.md5(s).hexdigest()[:8], 16) / 0xFFFFFFFF
+    if keep_ratio >= 1.0:
+        return True
+    if keep_ratio <= 0.0:
+        return False
+    raw = f"{seed}|{key}".encode("utf-8")
+    value = int(hashlib.md5(raw).hexdigest()[:8], 16) / 0xFFFFFFFF
     return value < float(keep_ratio)
 
 
@@ -241,7 +245,8 @@ class ESAMCCLIP11Dataset(Dataset):
                             dropped_by_keep_ratio[prompt] += 1
                             continue
                     sample_weight = max(score, LOSS_WEIGHT_FLOOR)
-                    sample_weight *= float(self.weak_class_loss_weight.get(prompt, 1.0))
+                    # Weak3 final class loss weight is handled by CLASS_WEIGHTS in train loss.
+                    # Do not multiply WEAK_CLASS_LOSS_WEIGHT here to avoid double weighting.
                     sample_weight *= float(self.class_loss_scale.get(prompt, 1.0))
                     base_samples.append(
                         {

@@ -13,16 +13,44 @@
 - `window keep_ratio=0.10`
 - `door keep_ratio=0.35`
 - `pole_light keep_ratio=0.50`
-- `window loss_weight=0.10`
-- `door loss_weight=0.35`
-- `pole_light loss_weight=0.50`
+- `window final_loss_weight=0.10`
+- `door final_loss_weight=0.35`
+- `pole_light final_loss_weight=0.50`
+
+注意：
+
+- `WEAK_CLASS_LOSS_WEIGHT` 只保留给日志和兼容字段
+- dataset 不再把 `WEAK_CLASS_LOSS_WEIGHT` 再乘到 `sample_weight`
+- 最终弱类 loss 权重来源只有 `CLASS_WEIGHTS`
 
 推荐命令
 
-1. split 1 epoch 诊断
+0. 静态检查
 
 ```powershell
-python "src/ESAM-CCLIP-11 - weakwindow/train_esam_cclip_11.py" `
+python -m py_compile src\ESAM-CCLIP-11-weak3\config_esam_cclip_11.py
+python -m py_compile src\ESAM-CCLIP-11-weak3\dataset_esam_cclip_11.py
+python -m py_compile src\ESAM-CCLIP-11-weak3\train_esam_cclip_11.py
+python -m py_compile src\ESAM-CCLIP-11-weak3\sweep_thresholds_11.py
+python -m py_compile src\ESAM-CCLIP-11-weak3\inference.py
+```
+
+1. dry run 数据集统计
+
+```powershell
+python src\ESAM-CCLIP-11-weak3\train_esam_cclip_11.py `
+  --train_json test\clean_rare\label\train_label.json `
+  --val_json test\clean_rare\label\val_label.json `
+  --train_list test\train_list.txt `
+  --val_list test\val_list.txt `
+  --dry_run_dataset_stats `
+  --run_name ESAM-CCLIP-11-weak3-dryrun
+```
+
+2. split 1 epoch 诊断
+
+```powershell
+python src\ESAM-CCLIP-11-weak3\train_esam_cclip_11.py `
   --train_json test/clean_rare/label/train_label.json `
   --val_json test/clean_rare/label/val_label.json `
   --train_list test/train_list.txt `
@@ -36,11 +64,11 @@ python "src/ESAM-CCLIP-11 - weakwindow/train_esam_cclip_11.py" `
   --rebuild_text_cache
 ```
 
-2. fullset 训练
+3. fullset 训练
 
 ```powershell
-python "src/ESAM-CCLIP-11 - weakwindow/train_esam_cclip_11.py" `
-  --train_json test/clean_rare/label/all-nocomputer.json `
+python src\ESAM-CCLIP-11-weak3\train_esam_cclip_11.py `
+  --train_json test/clean_rare/label/trainval_label.json `
   --no_train_split_filter `
   --no_val `
   --resume_best "<6CLS_BEST_CHECKPOINT>" `
@@ -52,10 +80,10 @@ python "src/ESAM-CCLIP-11 - weakwindow/train_esam_cclip_11.py" `
   --rebuild_text_cache
 ```
 
-3. weak3_safe sweep
+4. weak3_safe sweep
 
 ```powershell
-python "src/ESAM-CCLIP-11 - weakwindow/sweep_thresholds_11.py" `
+python src\ESAM-CCLIP-11-weak3\sweep_thresholds_11.py `
   --checkpoint test/train_output/ESAM-CCLIP-11-weak3-restart6-fullset-e3/final_fullset.pt `
   --sweep_mode weak3_safe `
   --objective balanced `
@@ -64,10 +92,10 @@ python "src/ESAM-CCLIP-11 - weakwindow/sweep_thresholds_11.py" `
   --write_back_path model/submit-rsam-weak3/sam3.pt
 ```
 
-4. 从 66.46 checkpoint 继续微调
+5. 从 66.46 checkpoint 继续微调
 
 ```powershell
-python "src/ESAM-CCLIP-11 - weakwindow/train_esam_cclip_11.py" `
+python src\ESAM-CCLIP-11-weak3\train_esam_cclip_11.py `
   --train_json test/clean_rare/label/train_label.json `
   --val_json test/clean_rare/label/val_label.json `
   --train_list test/train_list.txt `

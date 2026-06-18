@@ -157,6 +157,7 @@ def build_argparser():
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--workers", type=int, default=WORKERS)
+    parser.add_argument("--dry_run_dataset_stats", action="store_true", default=False)
     parser.add_argument("--no_val", action="store_true", default=False)
     parser.add_argument("--with_val", dest="no_val", action="store_false")
     parser.add_argument("--no_train_split_filter", action="store_true", default=False)
@@ -298,8 +299,12 @@ def resolve_runtime_paths(args):
     args.train_json = ensure_file(args.train_json, "train_json")
     args.all_json = resolve_project_path(args.all_json)
     args.image_root = ensure_dir(args.image_root, "image_root")
-    args.tokenizer_dir = ensure_dir(args.tokenizer_dir, "tokenizer_dir")
-    args.efficient_sam_ckpt = ensure_file(args.efficient_sam_ckpt, "efficient_sam_ckpt")
+    if args.dry_run_dataset_stats:
+        args.tokenizer_dir = resolve_project_path(args.tokenizer_dir)
+        args.efficient_sam_ckpt = resolve_project_path(args.efficient_sam_ckpt)
+    else:
+        args.tokenizer_dir = ensure_dir(args.tokenizer_dir, "tokenizer_dir")
+        args.efficient_sam_ckpt = ensure_file(args.efficient_sam_ckpt, "efficient_sam_ckpt")
     args.output_dir = resolve_project_path(args.output_dir)
     args.text_cache_path = resolve_project_path(args.text_cache_path)
     args.image_cache_dir = resolve_project_path(args.image_cache_dir)
@@ -345,10 +350,10 @@ def collate_fn(batch):
 
 def build_datasets(args):
     effective_hflip_prob = 0.0 if args.use_image_cache else HFLIP_PROB
-    LOGGER.info("[WeakWindow] disabled_train_classes=%s", args.disabled_train_classes)
-    LOGGER.info("[WeakWindow] class_keep_ratio=%s", args.class_keep_ratio)
-    LOGGER.info("[WeakWindow] class_loss_scale=%s", args.class_loss_scale)
-    LOGGER.info("[WeakWindow] val keeps all classes")
+    LOGGER.info("[Weak3] disabled_train_classes=%s", args.disabled_train_classes)
+    LOGGER.info("[Weak3] class_keep_ratio=%s", args.class_keep_ratio)
+    LOGGER.info("[Weak3] class_loss_scale=%s", args.class_loss_scale)
+    LOGGER.info("[Weak3] val keeps all classes")
     LOGGER.info("开始构建训练集: %s", args.train_json)
     train_dataset = ESAMCCLIP11Dataset(
         annotation_json=args.train_json,
@@ -418,6 +423,26 @@ def build_datasets(args):
         LOGGER.info("val class positive stats: %s", val_dataset.stats["positive"])
     LOGGER.info("effective train hflip_prob=%s", effective_hflip_prob)
     return train_dataset, val_dataset
+
+
+def build_dry_run_summary(train_dataset, val_dataset):
+    summary = {
+        "train": train_dataset.stats,
+        "val": val_dataset.stats if val_dataset is not None else None,
+        "weak3": {},
+    }
+    for class_name in ("window", "door", "pole_light"):
+        raw = int(train_dataset.stats.get("positive_raw", {}).get(class_name, 0))
+        kept = int(train_dataset.stats.get("positive_kept", {}).get(class_name, 0))
+        dropped = int(train_dataset.stats.get("dropped_by_weak3", {}).get(class_name, 0))
+        keep_ratio_actual = (kept / raw) if raw > 0 else None
+        summary["weak3"][class_name] = {
+            "raw": raw,
+            "kept": kept,
+            "dropped": dropped,
+            "keep_ratio_actual": keep_ratio_actual,
+        }
+    return summary
 
 
 def build_optimizer(model, decoder_lr, image_lr, text_lr, weight_decay):
@@ -1072,6 +1097,10 @@ def main():
     LOGGER.info("weak3_seed=%s", args.weak3_seed)
     LOGGER.info("weak_class_keep_ratio=%s", args.weak_class_keep_ratio)
     LOGGER.info("weak_class_loss_weight=%s", args.weak_class_loss_weight)
+    LOGGER.info("sample_weight participates in loss = True")
+    LOGGER.info("class_weights participates in loss = True")
+    LOGGER.info("weak_class_loss_weight multiplied in dataset = False")
+    LOGGER.info("effective weak class weight source = CLASS_WEIGHTS_ONLY")
     LOGGER.info("disabled_train_classes=%s", args.disabled_train_classes)
     LOGGER.info("class_keep_ratio=%s", args.class_keep_ratio)
     LOGGER.info("class_loss_scale=%s", args.class_loss_scale)
@@ -1093,25 +1122,50 @@ def main():
     if args.weak3_enabled:
         LOGGER.info("========== WEAK3 TRAINING ENABLED ==========")
         LOGGER.info(
-            "window keep_ratio=%.2f loss_weight=%.2f oversample=%s",
+            "window keep_ratio=%.2f final_loss_weight=%.2f",
             float(args.weak_class_keep_ratio.get("window", 1.0)),
             float(args.weak_class_loss_weight.get("window", 1.0)),
-            int(args.rare_oversample.get("window", 0)),
         )
         LOGGER.info(
-            "door keep_ratio=%.2f loss_weight=%.2f oversample=%s",
+            "door keep_ratio=%.2f final_loss_weight=%.2f",
             float(args.weak_class_keep_ratio.get("door", 1.0)),
             float(args.weak_class_loss_weight.get("door", 1.0)),
-            int(args.rare_oversample.get("door", 0)),
         )
         LOGGER.info(
-            "pole_light keep_ratio=%.2f loss_weight=%.2f oversample=%s",
+            "pole_light keep_ratio=%.2f final_loss_weight=%.2f",
             float(args.weak_class_keep_ratio.get("pole_light", 1.0)),
             float(args.weak_class_loss_weight.get("pole_light", 1.0)),
-            int(args.rare_oversample.get("pole_light", 0)),
         )
         LOGGER.info("11-class inference format kept unchanged")
-        LOGGER.info("===========================================")
+        LOGGER.info("avoid double weighting = True")
+        LOGGER.info("============================================")
+
+    preset_prompt_prototype_cfg = getattr(args, "prompt_prototype_cfg", None)
+    if args.use_prompt_prototype:
+        args.prompt_prototype_cfg = preset_prompt_prototype_cfg or PROMPT_PROTOTYPES
+    else:
+        args.prompt_prototype_cfg = {class_name: [class_name] for class_name in CLASSES}
+
+    train_dataset, val_dataset = build_datasets(args)
+    if args.dry_run_dataset_stats:
+        dry_run_summary = build_dry_run_summary(train_dataset, val_dataset)
+        for class_name in ("window", "door", "pole_light"):
+            class_stats = dry_run_summary["weak3"][class_name]
+            ratio = class_stats["keep_ratio_actual"]
+            ratio_text = f"{ratio:.4f}" if ratio is not None else "n/a"
+            LOGGER.info(
+                "%s raw=%d kept=%d dropped=%d keep_ratio_actual=%s",
+                class_name,
+                class_stats["raw"],
+                class_stats["kept"],
+                class_stats["dropped"],
+                ratio_text,
+            )
+        dry_run_path = run_dir / "dry_run_dataset_stats.json"
+        save_json(dry_run_path, dry_run_summary)
+        LOGGER.info("dry run dataset stats saved: %s", dry_run_path)
+        LOGGER.info("dry_run_dataset_stats=True，已完成数据集统计，跳过 tokenizer / text cache / model / training。")
+        return
 
     LOGGER.info("开始初始化模型...")
     model = ESAMCCLIPModel(
@@ -1154,12 +1208,7 @@ def main():
 
     LOGGER.info("开始加载 tokenizer: %s", args.tokenizer_dir)
     tokenizer = load_tokenizer(args.tokenizer_dir)
-    preset_prompt_prototype_cfg = getattr(args, "prompt_prototype_cfg", None)
-    if args.use_prompt_prototype:
-        prototype_config = preset_prompt_prototype_cfg or PROMPT_PROTOTYPES
-    else:
-        prototype_config = {class_name: [class_name] for class_name in CLASSES}
-    args.prompt_prototype_cfg = prototype_config
+    prototype_config = args.prompt_prototype_cfg
     LOGGER.info("prompt prototype classes=%d", len(args.prompt_prototype_cfg))
     for class_name in ("car", "window", "door", "pole_light"):
         if class_name in args.prompt_prototype_cfg:
@@ -1179,8 +1228,6 @@ def main():
     for class_name in CLASSES:
         if class_name not in text_cache_payload["embeddings"]:
             raise RuntimeError(f"text cache 缺少类别 embedding: {class_name}，请使用 --rebuild_text_cache")
-
-    train_dataset, val_dataset = build_datasets(args)
     LOGGER.info("开始构建 train DataLoader...")
     train_loader = DataLoader(
         train_dataset,

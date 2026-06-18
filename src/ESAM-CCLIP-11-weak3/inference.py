@@ -93,10 +93,10 @@ DEFAULT_THRESHOLDS = {
     "tree": 0.55,
     "animal": 0.50,
     "trash can": 0.45,
-    "window": 0.45,
+    "window": 0.60,
     "door": 0.45,
     "fence": 0.40,
-    "pole_light": 0.35,
+    "pole_light": 0.50,
     "motorcycle": 0.45,
 }
 
@@ -107,10 +107,10 @@ DEFAULT_POSTPROCESS = {
     "tree": {"min_area": 64, "fill_holes": True},
     "animal": {"min_area": 8, "fill_holes": False},
     "trash can": {"min_area": 4, "fill_holes": False},
-    "window": {"min_area": 4, "fill_holes": False},
-    "door": {"min_area": 8, "fill_holes": False},
+    "window": {"min_area": 64, "fill_holes": False, "topk_components": 3},
+    "door": {"min_area": 64, "fill_holes": False},
     "fence": {"min_area": 2, "fill_holes": False},
-    "pole_light": {"min_area": 1, "fill_holes": False},
+    "pole_light": {"min_area": 8, "fill_holes": False},
     "motorcycle": {"min_area": 4, "fill_holes": False},
 }
 

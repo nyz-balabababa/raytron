@@ -96,7 +96,8 @@ DEFAULT_SWEEP_CACHE_DIR = ROOT / "test" / "cache" / "sweep_thresholds_11"
 DEFAULT_PROMPT_FUSION_MODE = "prototype"
 DEFAULT_RAW_PROMPT_WEIGHT = 0.0
 DEFAULT_PROMPT_MATCH_MODE = "exact"
-WEAKWINDOW_SWEEP_ROOT = ROOT / "test" / "train_output" / "ESAM-CCLIP-11-weakwindow"
+WEAK3_SWEEP_ROOT = ROOT / "test" / "train_output" / "ESAM-CCLIP-11-weak3"
+WEAKWINDOW_SWEEP_ROOT = WEAK3_SWEEP_ROOT
 WINDOW_CONSERVATIVE_THRESH_GRID = [0.50, 0.55, 0.60, 0.65, 0.70]
 WINDOW_CONSERVATIVE_MIN_AREA_GRID = [8, 16, 32]
 WINDOW_CONSERVATIVE_TOPK_GRID = [None, 3]
@@ -107,7 +108,7 @@ WEAK3_THRESH_GRID = {
     "tree": [0.35, 0.40, 0.45],
     "animal": [0.28, 0.32, 0.36],
     "trash can": [0.28, 0.32, 0.36],
-    "window": [0.50, 0.55, 0.60, 0.65, 0.70],
+    "window": [0.50, 0.60, 0.70],
     "door": [0.40, 0.45, 0.50],
     "fence": [0.40, 0.45, 0.50],
     "pole_light": [0.45, 0.50, 0.55],
@@ -345,7 +346,7 @@ def canonicalize_sweep_mode(sweep_mode: str) -> str:
         return "best"
     if sweep_mode in {"stage2_submit_refine", "submit_stage2_refine"}:
         return "stage2_refine"
-    if sweep_mode in {"weak3", "weak3safe"}:
+    if sweep_mode in {"weak3", "weak3safe", "weak3_safe", "weakwindow", "weakwindow_safe", "weakwindowsafe"}:
         return "weak3_safe"
     return sweep_mode
 
@@ -470,7 +471,7 @@ def resolve_default_output_dir(sweep_mode: str) -> Path:
     if sweep_mode == "stage2_refine":
         return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_stage2_refine"
     if sweep_mode == "weak3_safe":
-        return WEAKWINDOW_SWEEP_ROOT / "sweep_A2_weak_window"
+        return WEAK3_SWEEP_ROOT / "sweep_weak3_safe"
     if sweep_mode == "stage2_submit_safe":
         return WEAKWINDOW_SWEEP_ROOT / "threshold_sweep_esam_11_stage2_submit_safe"
     if sweep_mode == "fine_recall":
@@ -1228,7 +1229,7 @@ def main():
     parser.add_argument("--text_cache_path", type=Path, default=DEFAULT_TEXT_CACHE_PATH)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE if DEFAULT_DEVICE else ("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--sweep_mode", choices=["best", "safe", "recall", "fine_recall", "hybrid", "hybrid_safe", "stage2_submit_safe", "stage2_refine", "stage2_submit_refine", "submit_stage2_refine", "weak3_safe", "weak3", "weak3safe"], default=DEFAULT_SWEEP_MODE)
+    parser.add_argument("--sweep_mode", choices=["best", "safe", "recall", "fine_recall", "hybrid", "hybrid_safe", "stage2_submit_safe", "stage2_refine", "stage2_submit_refine", "submit_stage2_refine", "weak3_safe", "weak3", "weak3safe", "weakwindow", "weakwindow_safe", "weakwindowsafe"], default=DEFAULT_SWEEP_MODE)
     parser.add_argument("--objective", choices=["all11", "balanced", "weak_window_balanced", "rare_without_window_safe"], default="all11")
     parser.add_argument("--write_back_checkpoint", dest="write_back_checkpoint", action="store_true")
     parser.add_argument("--no_write_back_checkpoint", dest="write_back_checkpoint", action="store_false")

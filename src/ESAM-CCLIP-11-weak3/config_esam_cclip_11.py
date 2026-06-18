@@ -6,7 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 HANXUE_ROOT = ROOT / "src" / "hanxue"
 OUTPUT_ROOT = ROOT / "test" / "train_output"
-WEAKWINDOW_OUTPUT_ROOT = OUTPUT_ROOT / "ESAM-CCLIP-11-weakwindow"
+WEAK3_OUTPUT_ROOT = OUTPUT_ROOT / "ESAM-CCLIP-11-weak3"
+WEAKWINDOW_OUTPUT_ROOT = WEAK3_OUTPUT_ROOT
 CACHE_ROOT = ROOT / "test" / "cache"
 
 # =========================
@@ -65,6 +66,8 @@ CLASS_WEIGHTS = {
 
 WEAK3_ENABLED = True
 WEAK3_SEED = 20260618
+WEAKWINDOW_ENABLED = WEAK3_ENABLED
+WEAKWINDOW_SEED = WEAK3_SEED
 WEAK_CLASS_KEEP_RATIO = {
     "window": 0.10,
     "door": 0.35,
@@ -292,7 +295,7 @@ PRESET_CONFIGS = {
     "base": {},
     "gamble_no_window_from6": {
         "run_name": "A1_no_window_from6",
-        "output_dir": WEAKWINDOW_OUTPUT_ROOT,
+        "output_dir": WEAK3_OUTPUT_ROOT,
         "train_json": TRAIN_JSON,
         "val_json": VAL_JSON,
         "train_list": TRAIN_LIST,
@@ -317,7 +320,7 @@ PRESET_CONFIGS = {
         "prompt_alias_prob": 0.0,
         "val_augment_prompt": False,
         "use_prompt_prototype": True,
-        "text_cache_path": CACHE_ROOT / "text_emb_11_weakwindow_A1.pt",
+        "text_cache_path": CACHE_ROOT / "text_emb_11_weak3_A1.pt",
         "class_weights": dict(CLASS_WEIGHTS),
         "rare_oversample": dict(RARE_OVERSAMPLE),
         "disabled_train_classes": ["window"],
@@ -326,7 +329,7 @@ PRESET_CONFIGS = {
     },
     "gamble_weak_window_from6": {
         "run_name": "A2_weak_window_from6",
-        "output_dir": WEAKWINDOW_OUTPUT_ROOT,
+        "output_dir": WEAK3_OUTPUT_ROOT,
         "train_json": TRAIN_JSON,
         "val_json": VAL_JSON,
         "train_list": TRAIN_LIST,
@@ -351,7 +354,7 @@ PRESET_CONFIGS = {
         "prompt_alias_prob": 0.0,
         "val_augment_prompt": False,
         "use_prompt_prototype": True,
-        "text_cache_path": CACHE_ROOT / "text_emb_11_weakwindow_A2.pt",
+        "text_cache_path": CACHE_ROOT / "text_emb_11_weak3_A2.pt",
         "class_weights": {
             "person": 1.0,
             "car": 1.0,
